@@ -14,7 +14,7 @@ use egui::{
 
 use crate::complete::{self, Candidate};
 use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, EXAMPLES, STARTER};
-use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, Opt};
+use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, OnCanvas, Opt};
 use crate::engine::{Engine, Job, Outcome, Preview};
 use crate::export::{self, Format, Options, Progress};
 use crate::reference::{self, Entry};
@@ -695,9 +695,13 @@ impl App {
             return Vec::new();
         }
         let Some(selected) = self.selected else { return Vec::new() };
-        let Some(call) = self.knobs.iter().find(|k| k.at == selected).and_then(|k| k.call.clone()) else {
+        let Some(knob) = self.knobs.iter().find(|k| k.at == selected) else { return Vec::new() };
+        // A shape inside a transform is drawn somewhere else entirely, so a
+        // handle at its own numbers would point at nothing.
+        if knob.on_canvas != OnCanvas::Yes {
             return Vec::new();
-        };
+        }
+        let Some(call) = knob.call.clone() else { return Vec::new() };
         // The numbers of that one call, by the name they were given.
         let number = |arg: &str| {
             self.knobs.iter().find(|k| k.arg == arg && k.call.as_ref().is_some_and(|c| c.at == call.at)).and_then(|k| {
@@ -1630,7 +1634,7 @@ struct Row {
 /// One number as a slider and its value, in the shape the code writes it.
 /// The value shown is read out of the source every frame; moving the
 /// handle writes a new one back.
-fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, dragging: &mut Dragging) -> Option<Edit> {
+fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, dragging: &mut Dragging) -> (Option<Edit>, bool) {
     let track = track_for(num, id, dragging);
     let mut value = num.value;
     let widget = egui::Slider::new(&mut value, track.clone())
@@ -1656,7 +1660,12 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, draggi
         false if dragging.as_ref().is_some_and(|(held, _)| *held == id) => *dragging = None,
         false => {}
     }
-    (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) })
+    let edit = (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) });
+    // Touching a slider says "this one" as much as clicking its name does.
+    // A slider only senses dragging, so a plain click on the track is
+    // caught here rather than waited for as a click that never comes.
+    let pressed_on_it = shown.hovered() && ui.input(|i| i.pointer.any_pressed());
+    (edit, shown.dragged() || shown.changed() || pressed_on_it)
 }
 
 /// A number of the work, shown on the canvas where it means something.
@@ -1787,6 +1796,8 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
         .fill(if here { Color32::from_rgb(0x26, 0x24, 0x1f) } else { Color32::TRANSPARENT })
         .inner_margin(egui::Margin { left: 16, right: 14, top: 3, bottom: 3 });
     let mut take_me_there = false;
+    // Touching anything in the row is a way of saying "this one".
+    let mut mine = false;
     let mut name = |ui: &mut egui::Ui, text: RichText, width: f32| {
         let label = egui::Label::new(text).truncate().halign(Align::LEFT).sense(Sense::click());
         let shown = match width > 0.0 {
@@ -1805,13 +1816,25 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
             );
             ui.painter().rect_filled(bar, 0, theme::AMBER);
         }
+        if here {
+            let about = match (knob.arg.as_str(), &knob.on_canvas) {
+                ("x" | "y" | "size", OnCanvas::Yes) => Some("its handle is on the picture".to_string()),
+                ("x" | "y" | "size", OnCanvas::Folded(by)) => {
+                    Some(format!("`{by}` bends the canvas after this, so it is not drawn where these numbers say"))
+                }
+                _ => None,
+            };
+            if let Some(about) = about {
+                ui.add(egui::Label::new(RichText::new(about).small().color(theme::FAINT)).wrap());
+            }
+        }
         match &knob.kind {
             Kind::Number(num) => {
                 ui.horizontal(|ui| {
                     name(ui, RichText::new(&knob.label).color(if here { theme::PAPER } else { theme::TEXT }), 62.0);
-                    if let Some(edit) = slider(ui, (index, 0), num, here, &mut row.dragging) {
-                        row.edits.push(edit);
-                    }
+                    let (edit, touched) = slider(ui, (index, 0), num, here, &mut row.dragging);
+                    row.edits.extend(edit);
+                    mine = mine || touched;
                 });
             }
             Kind::Spread { dist, per_point, names, from, to } => {
@@ -1826,9 +1849,9 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
                             Vec2::new(62.0, 20.0),
                             egui::Label::new(RichText::new(name).small().color(theme::MUTED)).halign(Align::LEFT),
                         );
-                        if let Some(edit) = slider(ui, (index, slot + 1), num, here, &mut row.dragging) {
-                            row.edits.push(edit);
-                        }
+                        let (edit, touched) = slider(ui, (index, slot + 1), num, here, &mut row.dragging);
+                        row.edits.extend(edit);
+                        mine = mine || touched;
                     });
                 }
             }
@@ -1912,6 +1935,10 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
             }
         }
     });
+    if mine {
+        row.selected = Some(knob.at);
+    }
+    // The name does more: it shows the piece of code too.
     if take_me_there {
         row.selected = Some(knob.at);
         row.reveal = Some(knob.at..knob.at + 1);
