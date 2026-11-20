@@ -40,6 +40,13 @@ impl Num {
         format!("{value:.*}", self.decimals)
     }
 
+    /// The same, but never coarser than hundredths: a position dragged
+    /// across the canvas needs somewhere to land, even where the work
+    /// happened to write a whole number.
+    pub fn text_fine(&self, value: f64) -> String {
+        format!("{value:.*}", self.decimals.max(2))
+    }
+
     /// What a slider should span for this number: a ratio runs from 0 to 1,
     /// anything else from 0 to twice what it reads, which keeps the handle
     /// in the middle and leaves room to go further. Typing goes past it.
@@ -90,15 +97,30 @@ pub enum Kind {
     Number(Num),
 }
 
+/// The call a number was written inside: `blob(x: 0.72, …)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub name: String,
+    /// Where the call starts, which tells its numbers apart from another
+    /// call's in the same statement.
+    pub at: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Knob {
     /// The statement it belongs to: `petal`, `render image`.
     pub group: String,
     /// What it is called where it sits: an argument name, or the binding's.
+    /// Repeats within a group are numbered, so this is for reading.
     pub label: String,
+    /// The same name before any numbering: what the argument is called in
+    /// the call, which is how the canvas knows an `x` from a `size`.
+    pub arg: String,
     pub line: usize,
     /// Where the whole thing starts, for ordering and for jumping to it.
     pub at: usize,
+    /// The call it was written inside, when it was.
+    pub call: Option<Call>,
     pub kind: Kind,
 }
 
@@ -209,7 +231,7 @@ pub fn knobs(src: &str) -> Vec<Knob> {
     let Ok(program) = lexer::lex(src).and_then(parser::parse) else {
         return Vec::new();
     };
-    let mut walk = Walk { src, out: Vec::new() };
+    let mut walk = Walk { src, out: Vec::new(), call: None };
     walk.work(&program.work);
     walk.out.sort_by_key(|k| k.at);
     walk.out.truncate(LIMIT);
@@ -237,6 +259,8 @@ fn number_the_repeats(knobs: &mut [Knob]) {
 struct Walk<'a> {
     src: &'a str,
     out: Vec<Knob>,
+    /// The call whose arguments are being walked.
+    call: Option<Call>,
 }
 
 impl Walk<'_> {
@@ -257,11 +281,13 @@ impl Walk<'_> {
             Stmt::Func { name, body, .. } => self.expr(body, name, name),
             Stmt::Output { val, .. } => self.expr(val, "output", "output"),
             Stmt::Constraint { val, .. } => self.expr(val, "constraint", "constraint"),
-            Stmt::Pattern { name, count, attrs, .. } => {
+            Stmt::Pattern { name, count, attrs, span } => {
                 self.expr(count, name, "count");
-                self.args(attrs, name, name, name);
+                self.args(attrs, name, name, name, range(self.src, *span).map(|r| r.start));
             }
-            Stmt::Render { kind, args, .. } => self.args(args, &format!("render {kind}"), kind, kind),
+            Stmt::Render { kind, args, span } => {
+                self.args(args, &format!("render {kind}"), kind, kind, range(self.src, *span).map(|r| r.start))
+            }
             Stmt::Grow { size, steps, rules, .. } => {
                 for (e, label) in [(size, "over"), (steps, "for")] {
                     if let Some(e) = e {
@@ -278,7 +304,8 @@ impl Walk<'_> {
 
     /// Names the arguments of a call: what they are called where given,
     /// else what the reference calls them, else what holds the call.
-    fn args(&mut self, args: &[Arg], group: &str, call: &str, inherited: &str) {
+    fn args(&mut self, args: &[Arg], group: &str, call: &str, inherited: &str, at: Option<usize>) {
+        let outer = self.call.replace(Call { name: call.to_string(), at: at.unwrap_or(0) }).filter(|_| at.is_some());
         let params = crate::reference::find(call).map(|e| e.params()).unwrap_or_default();
         // One parameter is the thing itself (`floor(x)`): its name there
         // says less than the name of what is being written.
@@ -295,10 +322,20 @@ impl Walk<'_> {
             };
             self.expr(&arg.val, group, &label);
         }
+        self.call = outer;
     }
 
     fn push(&mut self, group: &str, label: &str, span: Span, at: usize, kind: Kind) {
-        self.out.push(Knob { group: group.to_string(), label: label.to_string(), line: span.line, at, kind });
+        let knob = Knob {
+            group: group.to_string(),
+            label: label.to_string(),
+            arg: label.to_string(),
+            line: span.line,
+            at,
+            call: self.call.clone(),
+            kind,
+        };
+        self.out.push(knob);
     }
 
     fn expr(&mut self, e: &Expr, group: &str, label: &str) {
@@ -364,7 +401,7 @@ impl Walk<'_> {
                 }
                 self.expr(dist, group, label);
             }
-            ExprKind::Call(name, args) => self.args(args, group, name, label),
+            ExprKind::Call(name, args) => self.args(args, group, name, label, range(self.src, e.span).map(|r| r.start)),
             ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
                 self.expr(a, group, label);
                 self.expr(b, group, label);
@@ -621,6 +658,22 @@ mod tests {
                 assert!(!text.is_empty() && src.contains(text), "{text:?} is not in the source");
             }
         }
+    }
+
+    #[test]
+    fn a_number_knows_the_call_it_was_written_in() {
+        let src = "work W {\n  let a = merge(blob(x: 0.7, y: 0.5, size: 0.2), circle(x: 0.3, y: 0.4))\n}\n";
+        let knobs = knobs(src);
+        let called: Vec<_> = knobs.iter().map(|k| (k.call.as_ref().map(|c| c.name.as_str()), k.arg.as_str())).collect();
+        assert_eq!(
+            called,
+            [(Some("blob"), "x"), (Some("blob"), "y"), (Some("blob"), "size"), (Some("circle"), "x"), (Some("circle"), "y"),]
+        );
+        // The two calls are told apart, so the x of one is never read as
+        // the x of the other.
+        let at: Vec<usize> = knobs.iter().filter_map(|k| k.call.as_ref().map(|c| c.at)).collect();
+        assert_eq!(at[0], at[2], "the same blob");
+        assert_ne!(at[0], at[3], "a different call");
     }
 
     #[test]
