@@ -40,20 +40,38 @@ impl Num {
         format!("{value:.*}", self.decimals)
     }
 
-    /// How far dragging moves it per point: a hundredth of what it reads,
-    /// so 240 moves in twos and 0.22 in thousandths. Never less than a
-    /// quarter of its last digit, so the smallest written number still
-    /// moves, and never so fast that a pull across the pane is a leap.
-    pub fn speed(&self) -> f64 {
-        let step = 10f64.powi(-(self.decimals as i32));
-        (self.value.abs() / 100.0).max(step / 4.0)
+    /// What a slider should span for this number: a ratio runs from 0 to 1,
+    /// anything else from 0 to twice what it reads, which keeps the handle
+    /// in the middle and leaves room to go further. Typing goes past it.
+    pub fn track(&self) -> std::ops::RangeInclusive<f64> {
+        let v = self.value;
+        if v == 0.0 {
+            return 0.0..=1.0;
+        }
+        if self.decimals > 0 && (0.0..=1.0).contains(&v) {
+            return 0.0..=1.0;
+        }
+        if v < 0.0 {
+            return (2.0 * v)..=(-2.0 * v);
+        }
+        let whole = if self.decimals == 0 { 10.0 } else { 1.0 };
+        0.0..=(2.0 * v).max(whole)
     }
 }
 
-/// One option of a `choose`, as written.
+/// One option of a `choose`, as written. A weight is written in the code
+/// (`choose { 3: a | 1: b }`); the IDE writes 1 and 0 to hold a choice at
+/// one option while keeping the others where they are.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Opt {
     pub text: String,
+    pub at: Range<usize>,
+    pub weight: Option<Weight>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Weight {
+    pub value: f64,
     pub at: Range<usize>,
 }
 
@@ -122,15 +140,62 @@ pub fn add_option(src: &str, options: &[Opt], body: &Range<usize>) -> Option<Edi
     Some(Edit { at: last.at.end..last.at.end, text })
 }
 
+/// Which option a choice is held at: the one with a weight above zero,
+/// when every other weight is zero. Weights the artist wrote themselves
+/// (two of them above zero) are not a hold.
+pub fn held_at(options: &[Opt]) -> Option<usize> {
+    let weights: Vec<f64> = options.iter().map(|o| o.weight.as_ref().map_or(f64::NAN, |w| w.value)).collect();
+    if weights.iter().any(|w| w.is_nan()) {
+        return None;
+    }
+    let above: Vec<usize> = weights.iter().enumerate().filter(|(_, w)| **w > 0.0).map(|(k, _)| k).collect();
+    (above.len() == 1).then(|| above[0])
+}
+
+/// Whether the IDE may write weights here: when none are written, or when
+/// the ones written are its own.
+pub fn can_hold(options: &[Opt]) -> bool {
+    options.iter().all(|o| o.weight.is_none()) || held_at(options).is_some()
+}
+
+/// Holds a choice at one option, so every edition draws that one. The other
+/// options stay in the code at weight zero, ready to come back.
+pub fn hold(options: &[Opt], at: usize) -> Vec<Edit> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(k, option)| {
+            let value = if k == at { "1" } else { "0" };
+            match &option.weight {
+                Some(weight) => Edit { at: weight.at.clone(), text: value.into() },
+                None => Edit { at: option.at.start..option.at.start, text: format!("{value}: ") },
+            }
+        })
+        .collect()
+}
+
+/// Lets a held choice go: the weights the hold wrote are taken out again.
+pub fn release(options: &[Opt]) -> Vec<Edit> {
+    options
+        .iter()
+        .filter_map(|option| {
+            let weight = option.weight.as_ref()?;
+            // From the weight to the value takes the colon and its spaces.
+            Some(Edit { at: weight.at.start..option.at.start, text: String::new() })
+        })
+        .collect()
+}
+
 /// Removes one option, taking its separator with it.
 pub fn remove_option(src: &str, options: &[Opt], at: usize) -> Option<Edit> {
     if options.len() < 2 {
         return None;
     }
     let gone = options.get(at)?;
+    let start = gone.weight.as_ref().map_or(gone.at.start, |w| w.at.start);
     let at = match at {
         // The first option takes the bar that follows it.
-        0 => gone.at.start..options[1].at.start,
+        0 => start..options[1].weight.as_ref().map_or(options[1].at.start, |w| w.at.start),
         // Any other takes the bar before it.
         k => options[k - 1].at.end..gone.at.end,
     };
@@ -256,12 +321,17 @@ impl Walk<'_> {
                 let options: Vec<Opt> = branches
                     .iter()
                     .filter_map(|(weight, value)| {
-                        // A weighted branch (`3: "ember"`) is written in the
-                        // code, not here: its span covers only the value.
-                        (weight.span == value.span)
-                            .then(|| range(self.src, value.span))
-                            .flatten()
-                            .map(|at| Opt { text: self.src[at.clone()].to_string(), at })
+                        let at = range(self.src, value.span)?;
+                        // An unweighted branch has the weight the parser
+                        // made up for it, which sits on the value itself.
+                        let weight = match weight.span == value.span {
+                            true => None,
+                            // A weight that is not a plain number is the
+                            // artist's own arithmetic: leave the whole
+                            // choice alone.
+                            false => Some(Weight { value: literal(self.src, weight)?.value, at: range(self.src, weight.span)? }),
+                        };
+                        Some(Opt { text: self.src[at.clone()].to_string(), at, weight })
                     })
                     .collect();
                 if options.len() == branches.len() && !options.is_empty() {
@@ -422,19 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn dragging_moves_a_number_by_about_a_hundredth_of_itself() {
-        let number = |text: &str, value: f64| number(text, 0..text.len(), value);
-        // A whole number of millimetres moves in millimetres, a ratio
-        // written in hundredths in thousandths: forty points of drag is a
-        // small change in both.
-        assert_eq!(number("80", 80.0).speed(), 0.8);
-        assert!((number("0.22", 0.22).speed() - 0.0025).abs() < 1e-9);
-        assert!((number("0.015", 0.015).speed() - 0.00025).abs() < 1e-9);
-        // Zero still moves.
-        assert!(number("0.0", 0.0).speed() > 0.0);
-    }
-
-    #[test]
     fn a_number_keeps_its_shape_when_rewritten() {
         let src = "work W {\n  render sculpture(clouds(), side: 80, relief: 0.015)\n}\n";
         let knobs = knobs(src);
@@ -490,10 +547,64 @@ mod tests {
     }
 
     #[test]
-    fn weighted_and_computed_choices_are_left_alone() {
-        // A weight is part of the code, and `~clouds()` is not a plain range.
-        let src = "work W {\n  let a = choose { 3: \"ember\" | 1: \"night\" }\n  let b = ~normal(mean(a), 1)\n}\n";
-        assert!(!knobs(src).iter().any(|k| k.is_draw()), "{:?}", knobs(src));
+    fn the_artists_own_weights_are_not_a_hold() {
+        let src = "work W {\n  let a = choose { 3: \"ember\" | 1: \"night\" }\n}\n";
+        let Kind::Choose { options, .. } = &knobs(src)[0].kind else { panic!("not a choice") };
+        assert_eq!(options.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(), ["\"ember\"", "\"night\""]);
+        assert_eq!(held_at(options), None);
+        assert!(!can_hold(options), "two weights above zero are the artist's own");
+    }
+
+    #[test]
+    fn a_draw_on_an_expression_is_left_alone() {
+        // `~normal(mean(a), 1)` has no plain numbers to slide.
+        let src = "work W {\n  let a = clouds()\n  let b = ~normal(mean(a), 1)\n}\n";
+        assert!(!knobs(src).iter().any(|k| matches!(k.kind, Kind::Spread { .. })));
+    }
+
+    #[test]
+    fn a_choice_is_held_at_one_option_and_let_go_again() {
+        let src = "work W {\n  let s = choose { 5 | 6 | 12 }\n}\n";
+        let Kind::Choose { options, .. } = &knobs(src)[0].kind else { panic!("not a choice") };
+        assert!(can_hold(options) && held_at(options).is_none());
+
+        let mut held = src.to_string();
+        apply(&mut held, hold(options, 1));
+        assert!(held.contains("choose { 0: 5 | 1: 6 | 0: 12 }"), "{held}");
+
+        // Read back: the choice knows it is held, and at which option.
+        let Kind::Choose { options, .. } = &knobs(&held)[0].kind else { panic!("not a choice") };
+        assert_eq!(held_at(options), Some(1));
+        assert!(can_hold(options), "its own weights can be rewritten");
+
+        let mut moved = held.clone();
+        apply(&mut moved, hold(options, 2));
+        assert!(moved.contains("choose { 0: 5 | 0: 6 | 1: 12 }"), "{moved}");
+
+        let mut free = held.clone();
+        apply(&mut free, release(options));
+        assert_eq!(free, src, "letting go leaves the work as it was");
+    }
+
+    #[test]
+    fn removing_a_held_option_takes_its_weight_with_it() {
+        let src = "work W {\n  let s = choose { 0: 5 | 1: 6 | 0: 12 }\n}\n";
+        let Kind::Choose { options, .. } = &knobs(src)[0].kind else { panic!("not a choice") };
+        for (k, want) in [(0, "choose { 1: 6 | 0: 12 }"), (1, "choose { 0: 5 | 0: 12 }"), (2, "choose { 0: 5 | 1: 6 }")] {
+            let mut out = src.to_string();
+            apply(&mut out, vec![remove_option(src, options, k).unwrap()]);
+            assert!(out.contains(want), "removing {k} gave {out}");
+        }
+    }
+
+    #[test]
+    fn a_slider_spans_something_sensible() {
+        let number = |text: &str, value: f64| number(text, 0..text.len(), value);
+        assert_eq!(number("0.22", 0.22).track(), 0.0..=1.0);
+        assert_eq!(number("80", 80.0).track(), 0.0..=160.0);
+        assert_eq!(number("5", 5.0).track(), 0.0..=10.0);
+        assert_eq!(number("-4", -4.0).track(), -8.0..=8.0);
+        assert_eq!(number("1.2", 1.2).track(), 0.0..=2.4);
     }
 
     #[test]
