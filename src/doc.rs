@@ -239,6 +239,8 @@ pub struct Tab {
     /// Which of the work's renders the viewport shows.
     pub shown: String,
     pub clip: Option<Clip>,
+    /// What the work plays, when the viewport is showing its music.
+    pub music: Option<crate::score::Music>,
     pub playing: bool,
     /// Where in the loop, from 0 to 1.
     pub position: f64,
@@ -270,6 +272,7 @@ impl Tab {
             image_px: (0, 0),
             shown: "image".into(),
             clip: None,
+            music: None,
             playing: true,
             position: 0.0,
             note: None,

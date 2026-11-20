@@ -6,9 +6,9 @@ and reroll the seed until one is worth keeping.
 
 ![The alea IDE showing Rosace](docs/screenshot.png)
 
-> Status: early. It shows `render image` and `render video` works. Sound,
-> MIDI and sculpture viewports, and drawing on the canvas, are planned but
-> not there yet.
+> Status: early. It shows `render image`, `render video`, `render sound` and
+> `render midi` works. Playing the music, the sculpture viewport and drawing
+> on the canvas are planned but not there yet.
 
 ## What it does
 
@@ -51,6 +51,25 @@ out and the rest still work.
 file each, named by its seed, so a sheet of editions comes out in one go.
 The line above the buttons says what will be written, and a bar says where
 the run has got to.
+
+## Music
+
+![The roll of a work that plays](docs/music.png)
+
+A work that renders `sound` or `midi` lays its music out: a lane per layer,
+the notes where they fall, and a knob's turns as a curve. The bar numbers
+and the grid come from the work's own tempo.
+
+Lanes are named after what plays them — `pluck`, `marimba`, and a drum lane
+after the piece it strikes most, so three `drum` layers read as `kick`,
+`snare` and `open hat`. Each lane is drawn against its own range of pitches,
+so a bass line and a hi-hat are both worth looking at, and a note's weight
+shows in how brightly it is drawn. A layer that plays nothing in this
+edition says so rather than leaving an empty row.
+
+The music is read from the same MIDI alea would send to a DAW, so what you
+see here is what the work plays. It does not play it *here* yet: for sound,
+export a WAV, or run the work through the command line.
 
 ## Loops
 

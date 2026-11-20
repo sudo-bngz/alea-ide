@@ -12,6 +12,7 @@ mod draws;
 mod engine;
 mod export;
 mod reference;
+mod score;
 mod theme;
 
 use std::path::PathBuf;
