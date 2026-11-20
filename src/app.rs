@@ -549,6 +549,12 @@ impl App {
                     }
                 }
                 Outcome::Music(summary, music) => {
+                    let version = tab.asked.as_ref().map_or(0, |a| a.0);
+                    let name = format!("thumb-{}-{:x}", tab.id, tab.seed);
+                    let thumb = ctx.load_texture(name, sketch(&music), TextureOptions::NEAREST);
+                    if let Some(shot) = tab.history.get_mut(tab.at) {
+                        shot.thumb = Some((thumb, version));
+                    }
                     tab.summary = Some(summary);
                     tab.music = Some(music);
                     tab.clip = None;
@@ -816,8 +822,8 @@ impl App {
                 }
                 let mut open = None;
                 ui.menu_button("Examples", |ui| {
-                    for (name, _) in EXAMPLES {
-                        if ui.button(*name).clicked() {
+                    for (name, makes, _) in EXAMPLES {
+                        if ui.button(*name).on_hover_text(format!("{name} makes {makes}")).clicked() {
                             open = Some(*name);
                             ui.close();
                         }
@@ -1607,6 +1613,57 @@ fn thumbnail(p: &Preview) -> ColorImage {
     ColorImage::from_rgb([w, h], &rgb)
 }
 
+/// A work that plays has no picture to stand for it in the strip, so its
+/// editions are told apart by a sketch of the roll: one band a lane, a mark
+/// where a note falls.
+fn sketch(music: &crate::score::Music) -> ColorImage {
+    use crate::score::Lane;
+    let (w, h) = (THUMB, (THUMB * 3) / 4);
+    let ink = |c: Color32| [c.r(), c.g(), c.b()];
+    let mut rgb = vec![0u8; w * h * 3];
+    for px in rgb.chunks_exact_mut(3) {
+        px.copy_from_slice(&ink(theme::WELL));
+    }
+    let mut put = |x: usize, y: usize, c: [u8; 3]| {
+        if x < w && y < h {
+            rgb[(y * w + x) * 3..][..3].copy_from_slice(&c);
+        }
+    };
+    let colours = [theme::VERMILION, theme::AMBER, theme::MIST, theme::MOSS, theme::CLAY, theme::BLUSH];
+    let lanes = music.lanes.len().max(1);
+    let band = (h as f32 / lanes as f32).max(1.0);
+    for (k, (_, lane)) in music.lanes.iter().enumerate() {
+        let colour = ink(colours[k % colours.len()]);
+        let top = k as f32 * band;
+        let tall = (band - 1.0).max(1.0);
+        let place = |t: f64, step: f32| {
+            let x = (t / music.duration.max(0.001)) as f32 * (w - 1) as f32;
+            (x as usize, (top + (1.0 - step.clamp(0.0, 1.0)) * (tall - 1.0)) as usize)
+        };
+        match lane {
+            Lane::Notes { notes, low, high } => {
+                let span = (*high as f32 - *low as f32) + 1.0;
+                for note in notes {
+                    let step = (note.pitch as f32 - *low as f32 + 0.5) / span;
+                    let (from, y) = place(note.at, step);
+                    let (until, _) = place(note.until, step);
+                    for x in from..=until.max(from) {
+                        put(x, y, colour);
+                    }
+                }
+            }
+            Lane::Turns { points, .. } => {
+                for (t, value) in points {
+                    let (x, y) = place(*t, *value as f32);
+                    put(x, y, colour);
+                }
+            }
+            Lane::Silent => {}
+        }
+    }
+    ColorImage::from_rgb([w, h], &rgb)
+}
+
 /// Where the cursor is in the code of `doc`, counted in characters.
 fn cursor_of(ctx: &Context, doc: usize) -> Option<usize> {
     egui::TextEdit::load_state(ctx, Id::new(("code", doc)))?.cursor.char_range().map(|r| r.primary.index)
@@ -2123,5 +2180,26 @@ mod tests {
         };
         let t = thumbnail(&p);
         assert_eq!(t.size, [115, 144]);
+    }
+
+    #[test]
+    fn a_work_that_plays_is_sketched_for_the_strip() {
+        use crate::score::{Lane, Music, Note};
+        let note = |at: f64, pitch| Note { at, until: at + 0.2, pitch, velocity: 100 };
+        let music = Music {
+            tempo: 120.0,
+            duration: 4.0,
+            lanes: vec![
+                ("pluck".into(), Lane::Notes { notes: vec![note(0.0, 40), note(2.0, 52)], low: 40, high: 52 }),
+                ("organ".into(), Lane::Silent),
+            ],
+        };
+        let s = sketch(&music);
+        let lit = s.pixels.iter().filter(|p| **p != theme::WELL).count();
+        assert!(lit > 0, "the sketch came out empty");
+        // The notes stay in the top band, where the lane that plays them is.
+        let band = s.size[1] / 2;
+        let below = s.pixels.iter().skip(band * s.size[0]).filter(|p| **p != theme::WELL).count();
+        assert_eq!(below, 0, "the silent lane drew something");
     }
 }

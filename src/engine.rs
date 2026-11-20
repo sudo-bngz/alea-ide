@@ -423,13 +423,19 @@ mod tests {
 
     #[test]
     fn every_work_that_comes_with_the_ide_draws() {
-        for (name, text) in crate::doc::EXAMPLES {
+        for (name, _, text) in crate::doc::EXAMPLES {
             let job = Job { file: format!("{name}.alea"), ..job(text, 7) };
             let ed = edition(&job).unwrap_or_else(|e| panic!("{name}: {}", e.msg));
             assert!(!ed.renders.is_empty(), "{name} renders nothing");
             // Whatever it renders, the viewport can show one of them.
             let kinds: Vec<&str> = ed.renders.iter().map(|r| r.kind.as_str()).collect();
             assert!(kinds.iter().any(|k| matches!(*k, "image" | "video")), "{name} renders only {kinds:?}");
+            // And the one that plays lays out as lanes, not as an empty roll.
+            if kinds.contains(&"sound") {
+                let score = media::live_score(&ed).transpose().unwrap_or_else(|e| panic!("{name}: {}", e.msg)).expect("a score");
+                let music = crate::score::read(&score);
+                assert!(!music.is_empty(), "{name} plays nothing the roll can show");
+            }
         }
     }
 

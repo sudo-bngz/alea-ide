@@ -12,9 +12,13 @@ use crate::engine::{Failure, Summary};
 
 pub const STARTER: &str = include_str!("../assets/starter.alea");
 
-/// Works that come with the IDE, to open and pull apart. The first one is
-/// what a new window starts on.
-pub const EXAMPLES: &[(&str, &str)] = &[("rosace", STARTER), ("breathing", include_str!("../assets/breathing.alea"))];
+/// Works that come with the IDE, to open and pull apart: a name, what it
+/// makes, and its text. The first one is what a new window starts on.
+pub const EXAMPLES: &[(&str, &str, &str)] = &[
+    ("rosace", "a picture", STARTER),
+    ("breathing", "a loop", include_str!("../assets/breathing.alea")),
+    ("bassline", "music, and a video of it", include_str!("../assets/bassline.alea")),
+];
 
 /// A pause this long ends a step, so a word typed letter by letter, or a
 /// handle pulled across the canvas, comes back in one go.
@@ -64,7 +68,7 @@ impl Doc {
     /// One of the works that come with the IDE, under its own name so the
     /// errors and the command line it shows read like the real thing.
     pub fn example(name: &str) -> Option<Self> {
-        let (name, text) = EXAMPLES.iter().find(|(n, _)| *n == name)?;
+        let (name, _, text) = EXAMPLES.iter().find(|(n, ..)| *n == name)?;
         let mut doc = Doc::new(None, (*text).to_string());
         doc.unsaved_name = format!("{name}.alea");
         Some(doc)

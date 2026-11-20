@@ -110,6 +110,7 @@ pub fn read(score: &Score) -> Music {
         }
     }
     name_the_drums(&mut lanes);
+    name_the_knobs(&mut lanes);
     number_the_repeats(&mut lanes);
     Music { tempo: score.tempo, duration: score.duration, lanes }
 }
@@ -148,6 +149,36 @@ fn name_the_drums(lanes: &mut [(String, Lane)]) {
         let most = counts.into_iter().max_by_key(|(pitch, count)| (*count, std::cmp::Reverse(*pitch)));
         if let Some(piece) = most.and_then(|(pitch, _)| drum(pitch)) {
             *name = piece.to_string();
+        }
+    }
+}
+
+/// What a controller number turns, where MIDI agrees on one. `cc 74` says
+/// nothing; `cutoff` says what the curve is doing.
+fn knob(controller: u8) -> Option<&'static str> {
+    Some(match controller {
+        1 => "mod wheel",
+        7 => "volume",
+        10 => "pan",
+        11 => "expression",
+        71 => "resonance",
+        74 => "cutoff",
+        91 => "reverb",
+        93 => "chorus",
+        _ => return None,
+    })
+}
+
+/// A knob lane alea named after its number is renamed after what it turns.
+/// A lane the work named itself is left alone.
+fn name_the_knobs(lanes: &mut [(String, Lane)]) {
+    for (name, lane) in lanes.iter_mut() {
+        let Lane::Turns { controller, .. } = lane else { continue };
+        if !name.trim_start().starts_with("cc ") {
+            continue;
+        }
+        if let Some(turns) = knob(*controller) {
+            *name = turns.to_string();
         }
     }
 }
@@ -231,9 +262,30 @@ mod tests {
             msgs: vec![msg(0.0, 0, &[0xB0, 74, 0]), msg(1.0, 0, &[0xB0, 74, 127])],
         };
         let music = read(&score);
-        let (_, Lane::Turns { controller, points }) = &music.lanes[0] else { panic!("not a curve") };
+        let (name, Lane::Turns { controller, points }) = &music.lanes[0] else { panic!("not a curve") };
         assert_eq!(*controller, 74);
         assert_eq!(points, &[(0.0, 0.0), (1.0, 1.0)]);
+        // And it is named after what the knob does, not after its number.
+        assert_eq!(name, "cutoff");
+    }
+
+    #[test]
+    fn a_knob_nobody_agrees_on_keeps_its_number() {
+        let score = Score {
+            tracks: vec!["cc 20".into(), "wobble".into()],
+            tempo: 120.0,
+            duration: 2.0,
+            msgs: vec![
+                msg(0.0, 0, &[0xB0, 20, 0]),
+                msg(1.0, 0, &[0xB0, 20, 127]),
+                // A lane the work named itself keeps its own name.
+                msg(0.0, 1, &[0xB0, 74, 10]),
+                msg(1.0, 1, &[0xB0, 74, 110]),
+            ],
+        };
+        let music = read(&score);
+        let names: Vec<&str> = music.lanes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["cc 20", "wobble"]);
     }
 
     #[test]
