@@ -66,6 +66,42 @@ impl Doc {
     }
 }
 
+/// A loop at preview size, filling up frame by frame as the engine draws
+/// them.
+pub struct Clip {
+    pub width: usize,
+    pub height: usize,
+    pub fps: f64,
+    pub duration: f64,
+    pub frames: Vec<Option<TextureHandle>>,
+    pub ready: usize,
+}
+
+impl Clip {
+    pub fn new(width: usize, height: usize, fps: f64, duration: f64, frames: usize) -> Self {
+        Clip { width, height, fps, duration, frames: (0..frames).map(|_| None).collect(), ready: 0 }
+    }
+
+    pub fn put(&mut self, at: usize, frame: TextureHandle) {
+        if let Some(slot) = self.frames.get_mut(at) {
+            self.ready += slot.is_none() as usize;
+            *slot = Some(frame);
+        }
+    }
+
+    pub fn done(&self) -> bool {
+        self.ready == self.frames.len()
+    }
+
+    /// The frame for a moment of the loop, counted from 0 to 1; while the
+    /// loop is still being drawn, the last frame before it that is ready.
+    pub fn at(&self, position: f64) -> Option<&TextureHandle> {
+        let last = self.frames.len().saturating_sub(1);
+        let k = ((position.rem_euclid(1.0) * self.frames.len() as f64) as usize).min(last);
+        self.frames[..=k].iter().rev().chain(self.frames[k..].iter()).find_map(|f| f.as_ref())
+    }
+}
+
 /// One edition the tab has been to.
 pub struct Shot {
     pub seed: u64,
@@ -74,8 +110,9 @@ pub struct Shot {
     pub thumb: Option<(TextureHandle, u64)>,
 }
 
-/// What the tab last asked the engine for: document version, seed, size.
-pub type Ask = (u64, u64, usize);
+/// What the tab last asked the engine for: document version, seed, size,
+/// and which render.
+pub type Ask = (u64, u64, usize, String);
 
 pub struct Tab {
     pub id: u64,
@@ -88,6 +125,14 @@ pub struct Tab {
     pub at: usize,
     pub image: Option<TextureHandle>,
     pub image_px: (usize, usize),
+    /// Which of the work's renders the viewport shows.
+    pub shown: String,
+    pub clip: Option<Clip>,
+    pub playing: bool,
+    /// Where in the loop, from 0 to 1.
+    pub position: f64,
+    /// Why there is nothing to show, when there is nothing to show.
+    pub note: Option<String>,
     pub full: (usize, usize),
     pub summary: Option<Summary>,
     pub failure: Option<Failure>,
@@ -112,6 +157,11 @@ impl Tab {
             at: 0,
             image: None,
             image_px: (0, 0),
+            shown: "image".into(),
+            clip: None,
+            playing: true,
+            position: 0.0,
+            note: None,
             full: (0, 0),
             summary: None,
             failure: None,
@@ -119,6 +169,19 @@ impl Tab {
             asked: None,
             serial: 0,
             busy: false,
+        }
+    }
+
+    /// Shows something the work actually renders: a work with no `render
+    /// image` opens on whatever it does render.
+    pub fn follow(&mut self) {
+        let Some(summary) = &self.summary else { return };
+        if summary.renders.contains(&self.shown) {
+            return;
+        }
+        if let Some(first) = summary.renders.first() {
+            self.shown = first.clone();
+            self.position = 0.0;
         }
     }
 

@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alea::error::{Error, Res};
-use alea::eval::{self, Edition};
+use alea::eval::{self, Edition, Render};
 use alea::library::{self, Module};
+use alea::media::Visual;
 use alea::{lexer, media, parser};
 
 /// What to draw: one work, one seed.
@@ -29,6 +30,8 @@ pub struct Job {
     pub seed: u64,
     /// Longest side of the preview, in pixels.
     pub max_side: usize,
+    /// Which of the work's renders the viewport is showing.
+    pub shown: String,
 }
 
 pub struct Reply {
@@ -41,9 +44,31 @@ pub struct Reply {
 
 pub enum Outcome {
     Image(Preview),
-    /// The work is fine but has no `render image`.
-    NoImage(Summary),
+    /// The shape of a loop. Its frames follow, one reply each.
+    Clip(Clip),
+    Frame(Frame),
+    /// The work is fine, but this is not something the viewport can show.
+    Nothing(Summary, String),
     Failed(Failure),
+}
+
+/// A `render video` at preview size: what it is, before its frames arrive.
+pub struct Clip {
+    pub summary: Summary,
+    pub width: usize,
+    pub height: usize,
+    /// The size the work asks for, which is what an export writes.
+    pub full: (usize, usize),
+    /// Frames per second of the preview, which may be gentler than the
+    /// work's own.
+    pub fps: f64,
+    pub frames: usize,
+    pub duration: f64,
+}
+
+pub struct Frame {
+    pub at: usize,
+    pub rgb: Vec<u8>,
 }
 
 /// What an edition is, apart from its pixels.
@@ -75,6 +100,14 @@ pub struct Failure {
     /// alea's full diagnostic, with the source line and an underline.
     pub text: String,
 }
+
+/// A loop is previewed gently: a long one is not worth a frame of memory
+/// for every frame of video, and a still picture of it says nothing.
+const PREVIEW_FPS: f64 = 15.0;
+const PREVIEW_FRAMES: usize = 72;
+/// A frame of video is a whole field sampled, so the preview is smaller
+/// than a still.
+const PREVIEW_SIDE: usize = 384;
 
 /// Parses `source` as the work of `file`, loading what it `use`s from disk.
 ///
@@ -122,6 +155,23 @@ pub fn paint(ed: &Edition, max_side: Option<usize>) -> Res<Option<Preview>> {
     let height = ((spec.h as f64 * scale).round() as usize).max(16);
     let rgb = render.visual("the field to paint")?.rgb(width, height, spec.at, ed.seed, &spec.stops, spec.range);
     Ok(Some(Preview { summary: summary(ed), width, height, full: (spec.w, spec.h), rgb, elapsed: started.elapsed() }))
+}
+
+/// The first render of this kind in the edition.
+fn render_of<'a>(ed: &'a Edition, kind: &str) -> Option<&'a Render> {
+    ed.renders.iter().find(|r| r.kind == kind)
+}
+
+/// How a loop is previewed: its size, how many frames, and how fast.
+fn clip_plan(spec: &media::VideoSpec, max_side: usize) -> (usize, usize, f64, usize) {
+    let side = max_side.min(PREVIEW_SIDE);
+    let scale = (side as f64 / spec.w.max(spec.h) as f64).min(1.0);
+    let width = ((spec.w as f64 * scale).round() as usize).max(16);
+    let height = ((spec.h as f64 * scale).round() as usize).max(16);
+    let fps = (spec.fps as f64).min(PREVIEW_FPS);
+    let frames = ((spec.duration * fps).round() as usize).clamp(1, PREVIEW_FRAMES);
+    // Keep the loop the length the work asks for, however few frames it got.
+    (width, height, frames as f64 / spec.duration, frames)
 }
 
 fn failure(e: Error, job: &Job) -> Failure {
@@ -206,6 +256,21 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
                 continue;
             }
         };
+        let summary = summary(&ed);
+
+        if job.shown == "video" {
+            match clip(&job, &ed, &summary, &inbox, &send) {
+                Ok(Some(newer)) => next = Some(newer),
+                Ok(None) => {}
+                Err(()) => return,
+            }
+            continue;
+        }
+        if job.shown != "image" {
+            let what = format!("The viewport shows `image` and `video` for now, not `{}`.", job.shown);
+            send(true, Outcome::Nothing(summary, what));
+            continue;
+        }
 
         // A quick pass first, when it is worth one, then the real size.
         let quick = job.max_side / 4;
@@ -215,7 +280,7 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
             match guarded(&job, || paint(&ed, Some(*side))) {
                 Ok(Some(preview)) => send(last, Outcome::Image(preview)),
                 Ok(None) => {
-                    send(true, Outcome::NoImage(summary(&ed)));
+                    send(true, Outcome::Nothing(summary.clone(), "This work has no `render image`.".into()));
                     break;
                 }
                 Err(f) => {
@@ -237,6 +302,71 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
     }
 }
 
+/// Draws a loop frame by frame, sending each one off as it is done, so the
+/// first picture arrives long before the last. Stops early when a newer job
+/// is waiting, and hands it back.
+fn clip(
+    job: &Job,
+    ed: &Edition,
+    summary: &Summary,
+    inbox: &Receiver<Job>,
+    send: &impl Fn(bool, Outcome),
+) -> Result<Option<Job>, ()> {
+    let Some(render) = render_of(ed, "video") else {
+        send(true, Outcome::Nothing(summary.clone(), "This work has no `render video`.".into()));
+        return Ok(None);
+    };
+    let plan = guarded(job, || {
+        let spec = media::video_spec(render)?;
+        let visual = render.visual("the field to animate")?;
+        let (width, height, fps, frames) = clip_plan(&spec, job.max_side);
+        // What doesn't move is computed once, and one colour scale serves
+        // every frame, so the loop doesn't flicker. A painting looks after
+        // its own colours.
+        let still = match &visual {
+            Visual::Field(f) => Some((
+                f.cached_for_frames(width, height, ed.seed, 48),
+                spec.range.unwrap_or_else(|| media::animation_bounds(f, width, height, ed.seed)),
+            )),
+            Visual::Paint(_) => None,
+        };
+        Ok((spec, width, height, fps, frames, still))
+    });
+    let (spec, width, height, fps, frames, still) = match plan {
+        Ok(plan) => plan,
+        Err(f) => {
+            send(true, Outcome::Failed(f));
+            return Ok(None);
+        }
+    };
+    let clip = Clip { summary: summary.clone(), width, height, full: (spec.w, spec.h), fps, frames, duration: spec.duration };
+    send(false, Outcome::Clip(clip));
+
+    for k in 0..frames {
+        let t = k as f64 / frames as f64;
+        let frame = guarded(job, || {
+            let visual = render.visual("the field to animate")?;
+            Ok(match &still {
+                Some((field, bounds)) => media::frame_rgb(field, width, height, t, ed.seed, &spec.stops, Some(*bounds)),
+                None => visual.rgb(width, height, t, ed.seed, &spec.stops, None),
+            })
+        });
+        match frame {
+            Ok(rgb) => send(k + 1 == frames, Outcome::Frame(Frame { at: k, rgb })),
+            Err(f) => {
+                send(true, Outcome::Failed(f));
+                return Ok(None);
+            }
+        }
+        match newest(inbox) {
+            Ok(Some(newer)) => return Ok(Some(newer)),
+            Ok(None) => {}
+            Err(()) => return Err(()),
+        }
+    }
+    Ok(None)
+}
+
 /// Writes the edition's image at its full size as `<work>-<seed>.png` in
 /// `dir`, named like the command line names it.
 pub fn export_png(job: &Job, dir: &Path) -> Result<PathBuf, String> {
@@ -246,12 +376,75 @@ pub fn export_png(job: &Job, dir: &Path) -> Result<PathBuf, String> {
     })
     .map_err(|f| f.message)?
     .ok_or("this work has no `render image` to export")?;
-    let slug = Path::new(&job.file).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "work".into());
-    let path = dir.join(format!("{slug}-{:016x}.png", job.seed));
+    let path = dir.join(format!("{}-{:016x}.png", slug(job), job.seed));
     let img = image::RgbImage::from_raw(preview.width as u32, preview.height as u32, preview.rgb)
         .ok_or("the image buffer has the wrong size")?;
     img.save(&path).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// The most a GIF is asked to carry: past this it is a video file, which is
+/// what the command line writes with ffmpeg.
+const GIF_SIDE: usize = 480;
+const GIF_FPS: f64 = 15.0;
+const GIF_FRAMES: usize = 120;
+
+/// Writes the edition's loop as a GIF, which needs nothing installed. A
+/// long or large loop is capped: the line it reports says what was written.
+pub fn export_gif(job: &Job, dir: &Path) -> Result<(PathBuf, String), String> {
+    let path = dir.join(format!("{}-{:016x}.gif", slug(job), job.seed));
+    let said = guarded(job, || {
+        let ed = edition(job)?;
+        let render = render_of(&ed, "video").ok_or_else(|| Error::bare("this work has no `render video` to export"))?;
+        let spec = media::video_spec(render)?;
+        let visual = render.visual("the field to animate")?;
+
+        let scale = (GIF_SIDE as f64 / spec.w.max(spec.h) as f64).min(1.0);
+        let width = ((spec.w as f64 * scale).round() as usize).max(16);
+        let height = ((spec.h as f64 * scale).round() as usize).max(16);
+        let fps = (spec.fps as f64).min(GIF_FPS);
+        let frames = ((spec.duration * fps).round() as usize).clamp(1, GIF_FRAMES);
+        let fps = frames as f64 / spec.duration;
+        let still = match &visual {
+            Visual::Field(f) => Some((
+                f.cached_for_frames(width, height, ed.seed, 48),
+                spec.range.unwrap_or_else(|| media::animation_bounds(f, width, height, ed.seed)),
+            )),
+            Visual::Paint(_) => None,
+        };
+
+        let file = std::fs::File::create(&path).map_err(|e| Error::bare(format!("writing {}: {e}", path.display())))?;
+        let mut gif = image::codecs::gif::GifEncoder::new_with_speed(std::io::BufWriter::new(file), 10);
+        gif.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| Error::bare(e.to_string()))?;
+        // GIF delays are whole hundredths of a second, so the frame rate is
+        // rounded to one the format can keep.
+        let hundredths = (100.0 / fps).round().max(2.0) as u32;
+        for k in 0..frames {
+            let t = k as f64 / frames as f64;
+            let rgb = match &still {
+                Some((field, bounds)) => media::frame_rgb(field, width, height, t, ed.seed, &spec.stops, Some(*bounds)),
+                None => visual.rgb(width, height, t, ed.seed, &spec.stops, None),
+            };
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for px in rgb.chunks(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            let buffer = image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+                .ok_or_else(|| Error::bare("the frame buffer has the wrong size"))?;
+            let delay = image::Delay::from_numer_denom_ms(hundredths * 10, 1);
+            gif.encode_frame(image::Frame::from_parts(buffer, 0, 0, delay))
+                .map_err(|e| Error::bare(format!("writing {}: {e}", path.display())))?;
+        }
+        drop(gif);
+        Ok(format!("{width} × {height}, {frames} frames at {:.0} fps", 100.0 / hundredths as f64))
+    })
+    .map_err(|f| f.message)?;
+    Ok((path, said))
+}
+
+/// What the files of this work are called, as the command line names them.
+fn slug(job: &Job) -> String {
+    Path::new(&job.file).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "work".into())
 }
 
 #[cfg(test)]
@@ -260,8 +453,18 @@ mod tests {
 
     const ROSACE: &str = include_str!("../assets/starter.alea");
 
+    const BREATHING: &str = "// a loop\nwork Breathing {\n  let pulse = lfo()\n  let heart = circle(x: 0.5, y: 0.5, size: 0.2 + 0.15 * pulse, softness: 0.02)\n  output heart\n  render video(output, duration: 2, fps: 24, width: 120, palette: \"ember\")\n}\n";
+
     fn job(source: &str, seed: u64) -> Job {
-        Job { id: 1, source: Arc::from(source), file: "rosace.alea".into(), dir: PathBuf::from("."), seed, max_side: 96 }
+        Job {
+            id: 1,
+            source: Arc::from(source),
+            file: "rosace.alea".into(),
+            dir: PathBuf::from("."),
+            seed,
+            max_side: 96,
+            shown: "image".into(),
+        }
     }
 
     #[test]
@@ -300,6 +503,70 @@ mod tests {
         match guarded(&j, || edition(&j)) {
             Ok(ed) => assert!(paint(&ed, Some(64)).map_err(|e| e.msg).unwrap().is_none()),
             Err(f) => panic!("{}", f.text),
+        }
+    }
+
+    #[test]
+    fn a_loop_is_previewed_smaller_and_slower_than_it_plays() {
+        let ed = edition(&job(BREATHING, 3)).map_err(|e| e.msg).unwrap();
+        let spec = media::video_spec(render_of(&ed, "video").expect("a video")).map_err(|e| e.msg).unwrap();
+        let (w, h, fps, frames) = clip_plan(&spec, 1024);
+        assert_eq!((w, h), (120, 120), "smaller than the preview's limit already");
+        assert_eq!(frames, 30, "two seconds at fifteen frames");
+        assert!((frames as f64 / fps - spec.duration).abs() < 1e-9, "the loop keeps its length");
+
+        // A long loop is not given a frame for every frame of video.
+        let long = media::VideoSpec { duration: 30.0, ..spec };
+        let (_, _, fps, frames) = clip_plan(&long, 1024);
+        assert_eq!(frames, PREVIEW_FRAMES);
+        assert!((frames as f64 / fps - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_loop_comes_back_frame_by_frame() {
+        let engine = Engine::new(|| {});
+        engine.draw(Job { shown: "video".into(), ..job(BREATHING, 3) });
+        let (mut shape, mut frames) = (None, 0);
+        while let Ok(reply) = engine.replies.recv_timeout(Duration::from_secs(120)) {
+            match reply.outcome {
+                Outcome::Clip(clip) => shape = Some(clip),
+                Outcome::Frame(frame) => {
+                    let clip = shape.as_ref().expect("the shape of the loop comes first");
+                    assert_eq!(frame.rgb.len(), clip.width * clip.height * 3);
+                    assert_eq!(frame.at, frames);
+                    frames += 1;
+                }
+                Outcome::Failed(f) => panic!("{}", f.text),
+                _ => panic!("a video job answered with something else"),
+            }
+            if reply.last {
+                break;
+            }
+        }
+        assert_eq!(frames, shape.expect("a clip").frames);
+    }
+
+    #[test]
+    fn a_loop_is_exported_as_a_gif_that_plays() {
+        let dir = std::env::temp_dir().join(format!("alea-ide-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, said) = export_gif(&Job { shown: "video".into(), ..job(BREATHING, 3) }, &dir).unwrap();
+        assert_eq!(path.file_name().unwrap(), "rosace-0000000000000003.gif");
+        assert!(said.contains("120 × 120"), "{said}");
+        let (w, h) = image::image_dimensions(&path).unwrap();
+        assert_eq!((w, h), (120, 120));
+        assert!(std::fs::metadata(&path).unwrap().len() > 1000, "a gif of thirty frames is not tiny");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_work_without_a_loop_says_so_rather_than_failing() {
+        let engine = Engine::new(|| {});
+        engine.draw(Job { shown: "video".into(), ..job(ROSACE, 5) });
+        let reply = engine.replies.recv_timeout(Duration::from_secs(60)).unwrap();
+        match reply.outcome {
+            Outcome::Nothing(_, what) => assert!(what.contains("render video"), "{what}"),
+            _ => panic!("expected a plain answer"),
         }
     }
 

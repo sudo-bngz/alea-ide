@@ -6,9 +6,9 @@ and reroll the seed until one is worth keeping.
 
 ![The alea IDE showing Rosace](docs/screenshot.png)
 
-> Status: early. It shows `render image` works. Sound, MIDI, video and
-> sculpture viewports, and drawing on the canvas, are planned but not there
-> yet.
+> Status: early. It shows `render image` and `render video` works. Sound,
+> MIDI and sculpture viewports, and drawing on the canvas, are planned but
+> not there yet.
 
 ## What it does
 
@@ -26,6 +26,24 @@ and reroll the seed until one is worth keeping.
   for, named `<work>-<seed>.png` like the command line does.
 
 The same seed draws the same edition here and with `alea work.alea --seed N`.
+
+## Loops
+
+A work that renders video plays in the viewport, on a loop. The chips at the
+top of the viewport say what the work renders; click one to show it.
+
+The loop is drawn frame by frame in the background, so the first picture
+arrives long before the last, and it plays as soon as there is something to
+play: a counter says how far along it is. It is drawn smaller and slower
+than the work asks for — at most 384 pixels, 15 frames a second and 72
+frames — so that a long loop stays a preview. Its length is the work's own,
+and the transport underneath plays, holds and scrubs it.
+
+**Export GIF** writes the loop as a GIF, which needs nothing installed: at
+most 480 pixels, 15 frames a second and 120 frames, and the line it reports
+says exactly what was written. For an MP4, with its sound and at full size,
+run the work through the command line — `alea work.alea --seed N` — which
+uses ffmpeg.
 
 ## The controls
 
