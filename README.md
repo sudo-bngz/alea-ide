@@ -7,8 +7,8 @@ and reroll the seed until one is worth keeping.
 ![The alea IDE showing Rosace](docs/screenshot.png)
 
 > Status: early. It shows `render image`, `render video`, `render sound` and
-> `render midi` works. Playing the music, the sculpture viewport and drawing
-> on the canvas are planned but not there yet.
+> `render midi` works, and plays the ones that make sound. The sculpture
+> viewport and drawing on the canvas are planned but not there yet.
 
 ## What it does
 
@@ -68,8 +68,33 @@ shows in how brightly it is drawn. A layer that plays nothing in this
 edition says so rather than leaving an empty row.
 
 The music is read from the same MIDI alea would send to a DAW, so what you
-see here is what the work plays. It does not play it *here* yet: for sound,
-export a WAV, or run the work through the command line.
+see here is what the work plays.
+
+It plays it, too. The transport under the roll plays the loop, goes back to
+the top and scrubs, and the bar numbers scrub it as well; a playhead sweeps
+the lanes as it goes. The samples are rendered the way an export writes
+them, so what is heard is what is written, and they are rendered in the
+background: until they land, the transport says so. A new edition of the
+same work slips in without stopping, so a knob can be turned — or a step
+moved — while it plays.
+
+### Tapping out a pattern
+
+![Patterns tapped out in the roll](docs/sequencer.png)
+
+A lane whose rhythm is written out as `steps("X..x")` carries a strip of
+its own along the bottom: the pattern, step by step, as the work writes it.
+Tap a step to turn it on or off, right-click to walk it down through alea's
+weights — accent, note, ghost, silence. Each tap rewrites one character in
+the string, so the roll and the code say the same thing, and `Ctrl/Cmd+Z`
+takes it back like any other edit.
+
+The pattern repeats over the work, so the hand on one step is on every turn
+of it: hovering shows them all, and a tap moves them together. A rhythm the
+work makes another way — `euclid`, a field, a chord progression — has
+nothing written to tap. A `choose` between patterns is a choice the seed is
+still making; hold it at one option in the controls and its steps are
+written down, and tappable.
 
 ## Loops
 
@@ -153,16 +178,20 @@ what the IDE offers. `scripts/update-reference.sh ../alea` refreshes it.
 ## Run
 
 Requires a Rust toolchain (1.95+). On Linux you also need the usual
-windowing libraries (`libxkbcommon`, `libwayland`, `libgl`).
+windowing libraries (`libxkbcommon`, `libwayland`, `libgl`) and ALSA
+(`libasound2-dev`) for the sound output; macOS and Windows need nothing
+beyond the toolchain.
 
 ```sh
 cargo run --release                  # opens a starter work
 cargo run --release -- rosace.alea   # or a file
 ```
 
-Two works come with the IDE, under **Examples** in the top bar: `rosace`,
-the still one the window opens on, and `breathing`, which renders a video as
-well as an image — the one to open to see a loop play.
+Three works come with the IDE, under **Examples** in the top bar: `rosace`,
+the still one the window opens on, `breathing`, which renders a video as
+well as an image — the one to open to see a loop play — and `bassline`,
+which plays: it opens on its roll, where it can be heard and its patterns
+tapped out.
 
 ## Keys
 

@@ -14,6 +14,7 @@ mod export;
 mod reference;
 mod score;
 mod sound;
+mod steps;
 mod theme;
 
 use std::path::PathBuf;

@@ -19,6 +19,7 @@ use crate::engine::{Engine, Job, Outcome, Preview};
 use crate::export::{self, Format, Options, Progress};
 use crate::reference::{self, Entry};
 use crate::sound::Speaker;
+use crate::steps::{self, Pattern, Tap};
 use crate::theme;
 
 /// How long the text must rest before a preview is drawn.
@@ -71,6 +72,8 @@ pub struct App {
     /// The knobs of the active document, and the version they were read from.
     knobs: Vec<Knob>,
     knobs_of: Option<(usize, u64)>,
+    /// What each lane of the roll offers the hand, read with them.
+    patterns: Vec<Tap>,
     reference: Option<Reference>,
     /// The sound output, and whose music is loaded in it: a tab, as of one
     /// of its editions.
@@ -138,6 +141,7 @@ impl App {
             selected: None,
             knobs: Vec::new(),
             knobs_of: None,
+            patterns: Vec::new(),
             reference: None,
             speaker: Speaker::new(),
             sounding: None,
@@ -791,11 +795,17 @@ impl App {
     }
 
     /// The knobs of the work on screen, read again when its text changes.
+    /// The patterns it plays come from the same reading.
     fn knobs(&mut self) {
         let doc = self.tabs[self.active].doc;
         let want = (doc, self.docs[doc].version);
         if self.knobs_of != Some(want) {
             self.knobs = draws::knobs(&self.docs[doc].text);
+            self.patterns = steps::patterns(&self.docs[doc].text, "sound");
+            if self.patterns.iter().all(|t| *t == Tap::Nothing) {
+                // A work that only writes MIDI keeps its patterns there.
+                self.patterns = steps::patterns(&self.docs[doc].text, "midi");
+            }
             self.knobs_of = Some(want);
         }
     }
@@ -1579,9 +1589,9 @@ impl App {
             let tab = &self.tabs[self.active];
             if let (true, Some(music)) = (matches!(shown.as_str(), "sound" | "midi"), &tab.music) {
                 let playhead = tab.take.as_ref().map(|_| self.speaker.at());
-                if let Some(seconds) = roll(ui, music, area, playhead) {
-                    scrub_to = Some(seconds);
-                }
+                let (scrubbed, tapped) = roll(ui, music, area, playhead, &self.patterns);
+                scrub_to = scrubbed;
+                edits.extend(tapped);
                 return;
             }
             let dim = tab.failure.is_some();
@@ -1856,7 +1866,13 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, draggi
 
 /// The music of a work laid out in time: a lane per layer, notes where
 /// they fall, and a knob's turns as a line.
-fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Option<f64>) -> Option<f64> {
+fn roll(
+    ui: &mut egui::Ui,
+    music: &crate::score::Music,
+    area: Rect,
+    playhead: Option<f64>,
+    patterns: &[Tap],
+) -> (Option<f64>, Vec<Edit>) {
     use crate::score::Lane;
     const NAMES: f32 = 96.0;
     // A lane for each layer, and a strip at the top for the bar numbers.
@@ -1866,7 +1882,7 @@ fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Op
     let painter = ui.painter().clone();
 
     // The bar numbers are also where the music is scrubbed from.
-    let mut seek = None;
+    let (mut seek, mut edits) = (None, Vec::new());
     let ruler = ui.interact(bars, ui.id().with("ruler"), Sense::click_and_drag());
     if let Some(p) = ruler.interact_pointer_pos() {
         let across = ((p.x - roll.left()) / roll.width().max(1.0)).clamp(0.0, 1.0);
@@ -1911,7 +1927,17 @@ fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Op
             theme::TEXT,
         );
 
-        let inside = Rect::from_min_max(egui::pos2(roll.left(), top + 4.0), egui::pos2(roll.right(), top + height - 4.0));
+        let mut inside = Rect::from_min_max(egui::pos2(roll.left(), top + 4.0), egui::pos2(roll.right(), top + height - 4.0));
+        // A lane the work writes out step by step gets a strip of its own
+        // along the bottom: the pattern, as it is written, to tap at.
+        let offers = patterns.get(k).unwrap_or(&Tap::Nothing);
+        let room = height >= 34.0 && *offers != Tap::Nothing;
+        let tappable = offers.pattern().filter(|_| room);
+        let strip = room.then(|| {
+            let top = row.bottom() - 15.0;
+            inside = Rect::from_min_max(inside.min, egui::pos2(inside.right(), top - 3.0));
+            Rect::from_min_max(egui::pos2(roll.left(), top), egui::pos2(roll.right(), row.bottom() - 4.0))
+        });
         match lane {
             Lane::Notes { notes, low, high } => {
                 // Each lane is drawn against its own range, so a bass line
@@ -1939,6 +1965,22 @@ fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Op
                 painter.add(egui::Shape::line(line, Stroke::new(1.5_f32, ink)));
             }
         }
+
+        match (tappable, strip) {
+            (Some(pattern), Some(strip)) => {
+                if let Some(edit) = taps(ui, &painter, pattern, strip, bars_of(music), ink, k) {
+                    edits.push(edit);
+                }
+            }
+            // The steps are written down, but which of them the work plays
+            // is still the seed's to say: holding the choice settles it.
+            (_, Some(strip)) if *offers == Tap::Choosing => {
+                let says = "hold this choice in the controls to tap its steps";
+                let at = egui::pos2(strip.left() + 4.0, strip.center().y);
+                painter.text(at, Align2::LEFT_CENTER, says, FontId::proportional(11.0), theme::FAINT);
+            }
+            _ => {}
+        }
     }
 
     // Where it is up to, if it is playing.
@@ -1948,7 +1990,57 @@ fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Op
         let head = [egui::pos2(x - 4.0, bars.top()), egui::pos2(x + 4.0, bars.top()), egui::pos2(x, bars.top() + 6.0)];
         painter.add(egui::Shape::convex_polygon(head.to_vec(), theme::VERMILION, Stroke::NONE));
     }
-    seek
+    (seek, edits)
+}
+
+/// How many bars the music lasts, which is how often a written pattern
+/// comes round in it.
+fn bars_of(music: &crate::score::Music) -> f64 {
+    music.beats() / 4.0
+}
+
+/// One lane's pattern, drawn step by step and open to the hand: the roll as
+/// a sequencer. A tap turns a step on or off; the other button walks it
+/// down through the weights alea writes, from an accent to silence.
+fn taps(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pattern: &Pattern,
+    strip: Rect,
+    bars: f64,
+    ink: Color32,
+    lane: usize,
+) -> Option<Edit> {
+    let cells = steps::cells(pattern, bars).max(1);
+    let wide = strip.width() / cells as f32;
+    let hit = ui.interact(strip, ui.id().with(("steps", lane)), Sense::click());
+    let under = hit.hover_pos().map(|p| (((p.x - strip.left()) / wide) as usize).min(cells - 1) % pattern.steps());
+    for cell in 0..cells {
+        let x = strip.left() + cell as f32 * wide;
+        let box_ = Rect::from_min_size(egui::pos2(x + 0.5, strip.top()), Vec2::new((wide - 1.0).max(1.0), strip.height()));
+        let step = cell % pattern.steps();
+        let weight = match pattern.step(step) {
+            'X' => 1.0,
+            'x' => 0.6,
+            'o' => 0.3,
+            _ => 0.0,
+        };
+        let fill = if weight > 0.0 { ink.gamma_multiply(weight) } else { theme::LINE.gamma_multiply(0.6) };
+        painter.rect_filled(box_, 1, fill);
+        // The pattern comes round again and again: the hand on one step is
+        // on every turn of it, which is what the edit will change.
+        if under == Some(step) {
+            painter.rect_stroke(box_.expand(1.0), 1, Stroke::new(1.0_f32, theme::PAPER), egui::StrokeKind::Outside);
+        }
+    }
+    let step = under?;
+    let says = format!("Step {} of {}: tap to turn it on or off, right-click for a softer one", step + 1, pattern.steps());
+    let hit = hit.on_hover_text(says);
+    match (hit.clicked(), hit.secondary_clicked()) {
+        (true, _) => pattern.toggle(step),
+        (_, true) => pattern.cycle(step),
+        _ => None,
+    }
 }
 
 /// A number of the work, shown on the canvas where it means something.
