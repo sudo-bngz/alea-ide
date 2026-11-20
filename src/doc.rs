@@ -245,6 +245,13 @@ pub struct Tab {
     pub clip: Option<Clip>,
     /// What the work plays, when the viewport is showing its music.
     pub music: Option<crate::score::Music>,
+    /// The score itself, which is what goes out to the instruments.
+    pub score: Option<std::sync::Arc<alea::midi::Score>>,
+    /// Where each lane of it is sent, by lane name.
+    pub routes: std::collections::HashMap<String, crate::midiout::Route>,
+    /// Whether the machine's own speakers play it as well as the
+    /// instruments it is sent to.
+    pub monitor: bool,
     /// The same music as samples, once they are rendered.
     pub take: Option<crate::sound::Take>,
     /// Bumped whenever a new take arrives, so the speaker knows to pick it up.
@@ -281,6 +288,9 @@ impl Tab {
             shown: "image".into(),
             clip: None,
             music: None,
+            score: None,
+            routes: std::collections::HashMap::new(),
+            monitor: true,
             take: None,
             heard: 0,
             playing: true,

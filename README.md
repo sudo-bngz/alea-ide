@@ -78,6 +78,27 @@ background: until they land, the transport says so. A new edition of the
 same work slips in without stopping, so a knob can be turned — or a step
 moved — while it plays.
 
+### Out to the instruments
+
+![Each lane pointed at an instrument](docs/midi.png)
+
+**MIDI out…**, under the roll, points each lane at an instrument of its
+own, the way a DAW points a track at an output: a port on the machine, a
+port of the studio's own that another program can read from (`alea-ide`),
+or — with nothing to send to — the messages written out as words, the way
+`alea --midi-port print` writes them. alea already gives every layer a
+channel of its own; a lane can be given another one.
+
+The messages are the ones `render midi` writes, so the instruments play
+what the file would hold. They go out on a thread of its own, on time,
+and a stop sends a note off for everything held and all-notes-off on
+every channel played on — nothing is left hanging. **Panic** does that at
+any moment. Moving a lane while it plays takes effect there and then, and
+a new edition takes over where the one playing is.
+
+With a lane sent out, the machine's own speakers stay quiet unless *play
+it here as well* is ticked.
+
 ### Tapping out a pattern
 
 ![Patterns tapped out in the roll](docs/sequencer.png)
@@ -179,7 +200,7 @@ what the IDE offers. `scripts/update-reference.sh ../alea` refreshes it.
 
 Requires a Rust toolchain (1.95+). On Linux you also need the usual
 windowing libraries (`libxkbcommon`, `libwayland`, `libgl`) and ALSA
-(`libasound2-dev`) for the sound output; macOS and Windows need nothing
+(`libasound2-dev`) for the sound and MIDI output; macOS and Windows need nothing
 beyond the toolchain.
 
 ```sh
