@@ -14,7 +14,7 @@ use egui::{
 
 use crate::complete::{self, Candidate};
 use crate::doc::{format_seed, parse_seed, random_seed, Doc, Tab, STARTER};
-use crate::draws::{self, Edit, Kind, Knob, Num};
+use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, Opt};
 use crate::engine::{self, Engine, Job, Outcome, Preview};
 use crate::reference::{self, Entry};
 use crate::theme;
@@ -46,6 +46,10 @@ pub struct App {
     /// until it is finished: half-typed code would parse as nothing and the
     /// controls would vanish under the hand editing them.
     editing: Option<Editing>,
+    /// The choice whose options are being edited as text, and the row the
+    /// hand is on.
+    editing_choice: Option<usize>,
+    selected: Option<usize>,
     /// The knobs of the active document, and the version they were read from.
     knobs: Vec<Knob>,
     knobs_of: Option<(usize, u64)>,
@@ -99,6 +103,8 @@ impl App {
             side: 512,
             offer: None,
             editing: None,
+            editing_choice: None,
+            selected: None,
             knobs: Vec::new(),
             knobs_of: None,
             reference: None,
@@ -807,12 +813,17 @@ impl App {
         let doc_index = self.tabs[self.active].doc;
         let source = self.docs[doc_index].text.clone();
         let knobs = std::mem::take(&mut self.knobs);
-        let mut editing = self.editing.take();
-        let mut edits: Vec<Edit> = Vec::new();
         let draws = knobs.iter().filter(|k| k.is_draw()).count();
+        let mut row = Row {
+            editing: self.editing.take(),
+            editing_choice: self.editing_choice.take(),
+            selected: self.selected,
+            reveal: None,
+            edits: Vec::new(),
+        };
 
         let frame = egui::Frame::new().fill(theme::PANEL);
-        egui::SidePanel::right("controls").frame(frame).default_width(330.0).width_range(250.0..=560.0).show(ctx, |ui| {
+        egui::SidePanel::right("controls").frame(frame).default_width(344.0).width_range(260.0..=560.0).show(ctx, |ui| {
             header(ui, "CONTROLS", |ui| {
                 let text = match knobs.len() {
                     0 => "nothing to tune".to_string(),
@@ -823,27 +834,35 @@ impl App {
             self.facts_panel(ui);
 
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                ui.add_space(6.0);
                 if knobs.is_empty() {
+                    ui.add_space(14.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.add_space(14.0);
-                        let text = "Every `choose`, `~` and number of a work that reads correctly turns up here.";
+                        ui.add_space(16.0);
+                        let text = "Every choice, draw and number of a work that reads correctly turns up here.";
                         ui.add(egui::Label::new(RichText::new(text).color(theme::MUTED)).wrap());
                     });
                 }
-                for (title, want_draw) in [("DRAWS", true), ("NUMBERS IN THE CODE", false)] {
+                for (title, want_draw) in [("DRAWS IN THIS EDITION", true), ("NUMBERS IN THE CODE", false)] {
                     let section: Vec<(usize, &Knob)> =
                         knobs.iter().enumerate().filter(|(_, k)| k.is_draw() == want_draw).collect();
                     if section.is_empty() {
                         continue;
                     }
-                    ui.add_space(8.0);
-                    egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(14, 5)).show(ui, |ui| {
+                    let held = section
+                        .iter()
+                        .filter(|(_, k)| matches!(&k.kind, Kind::Choose { options, .. } if draws::held_at(options).is_some()))
+                        .count();
+                    ui.add_space(6.0);
+                    egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(16, 6)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(caption(title));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let hint = if want_draw { "the seed decides these" } else { "written once" };
-                                ui.label(RichText::new(hint).small().color(theme::FAINT));
+                                let (text, ink) = match (want_draw, held) {
+                                    (true, 0) => ("the seed decides these".to_string(), theme::FAINT),
+                                    (true, n) => (format!("{n} held"), theme::BLUSH),
+                                    _ => ("written once".to_string(), theme::FAINT),
+                                };
+                                ui.label(RichText::new(text).small().color(ink));
                             });
                         });
                     });
@@ -851,24 +870,44 @@ impl App {
                     for (k, knob) in section {
                         if group != knob.group {
                             group = knob.group.clone();
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                ui.add_space(14.0);
-                                ui.label(caption(&knob.group.to_uppercase()));
+                                ui.add_space(16.0);
+                                ui.label(RichText::new(&knob.group).color(theme::MUTED));
                             });
+                            ui.add_space(2.0);
                         }
-                        egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 3)).show(ui, |ui| {
-                            knob_row(ui, k, knob, &source, &mut editing, &mut edits);
-                        });
+                        knob_row(ui, k, knob, &source, &mut row);
                     }
                 }
-                ui.add_space(14.0);
+                ui.add_space(16.0);
             });
         });
 
         self.knobs = knobs;
-        self.editing = editing;
-        self.rewrite(edits);
+        self.editing = row.editing;
+        self.editing_choice = row.editing_choice;
+        self.selected = row.selected;
+        if let Some(at) = row.reveal {
+            self.reveal(ctx, at);
+        }
+        self.rewrite(row.edits);
+    }
+
+    /// Puts the cursor on the piece of code a control belongs to, selected,
+    /// so the pane and the text always say the same thing.
+    fn reveal(&mut self, ctx: &Context, at: std::ops::Range<usize>) {
+        let doc_index = self.tabs[self.active].doc;
+        let text = &self.docs[doc_index].text;
+        if at.end > text.len() {
+            return;
+        }
+        let (from, to) = (char_of_byte(text, at.start), char_of_byte(text, at.end));
+        let id = Id::new(("code", doc_index));
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(from), CCursor::new(to))));
+        egui::TextEdit::store_state(ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
     /// What the edition is, under the controls.
@@ -1072,88 +1111,203 @@ fn entry_card(ui: &mut egui::Ui, entry: &Entry, compact: bool) {
     });
 }
 
-/// One number, dragged. The value it shows is read out of the code every
-/// frame, and dragging writes a new one back in the same shape.
-fn drag(ui: &mut egui::Ui, id: (usize, usize), num: &Num) -> Option<Edit> {
+/// What a row of controls may hand back to the pane.
+struct Row {
+    editing: Option<Editing>,
+    editing_choice: Option<usize>,
+    selected: Option<usize>,
+    /// A piece of code to put the cursor on.
+    reveal: Option<std::ops::Range<usize>>,
+    edits: Vec<Edit>,
+}
+
+/// One number as a slider and its value, in the shape the code writes it.
+/// The value shown is read out of the source every frame; moving the
+/// handle writes a new one back.
+fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool) -> Option<Edit> {
     let mut value = num.value;
-    let widget = egui::DragValue::new(&mut value).speed(num.speed()).fixed_decimals(num.decimals);
-    let shown = ui.push_id(id, |ui| ui.add(widget)).inner;
+    let widget = egui::Slider::new(&mut value, num.track())
+        .fixed_decimals(num.decimals)
+        .clamping(egui::SliderClamping::Never)
+        .trailing_fill(true)
+        .show_value(true);
+    let room = (ui.available_width() - 72.0).clamp(60.0, 210.0);
+    let shown = ui
+        .push_id(id, |ui| {
+            ui.spacing_mut().slider_width = room;
+            // The part of the track behind the handle: the row the hand is
+            // on shows it in amber, the others in grey.
+            ui.visuals_mut().selection.bg_fill = if accent { theme::AMBER } else { theme::MUTED };
+            ui.visuals_mut().widgets.inactive.bg_fill = theme::LINE;
+            ui.add(widget)
+        })
+        .inner;
     (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) })
 }
 
+/// The options of a choice, side by side. Clicking one holds the choice
+/// there; clicking the one it is held at lets it go again.
+fn segmented(ui: &mut egui::Ui, id: usize, options: &[Opt], held: Option<usize>, can_hold: bool) -> Option<usize> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
+        for (k, option) in options.iter().enumerate() {
+            let on = held == Some(k);
+            let shown = option.text.trim_matches('"');
+            let text = RichText::new(shown).monospace().size(12.0).color(if on { theme::INK } else { theme::TEXT });
+            let button = egui::Button::new(text)
+                .fill(if on { theme::PAPER } else { theme::BAR })
+                .stroke(Stroke::new(1.0_f32, if on { theme::PAPER } else { theme::EDGE }))
+                .corner_radius(3)
+                .min_size(Vec2::new(30.0, 24.0));
+            let hint = match (can_hold, on) {
+                (false, _) => "This choice is weighted in the code".to_string(),
+                (true, true) => "Let this choice go: every edition draws its own again".to_string(),
+                (true, false) => format!("Hold this choice at {shown} for every edition"),
+            };
+            if ui.push_id((id, k), |ui| ui.add_enabled(can_hold, button)).inner.on_hover_text(hint).clicked() {
+                clicked = Some(k);
+            }
+        }
+    });
+    clicked
+}
+
 /// One row of the controls: a choice, a range, or a number.
-fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, editing: &mut Option<Editing>, edits: &mut Vec<Edit>) {
-    match &knob.kind {
-        Kind::Number(num) => {
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::TEXT)).truncate());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(edit) = drag(ui, (index, 0), num) {
-                        edits.push(edit);
+fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mut Row) {
+    let here = row.selected == Some(knob.at);
+    let frame = egui::Frame::new()
+        .fill(if here { Color32::from_rgb(0x26, 0x24, 0x1f) } else { Color32::TRANSPARENT })
+        .inner_margin(egui::Margin { left: 16, right: 14, top: 3, bottom: 3 });
+    let mut take_me_there = false;
+    let mut name = |ui: &mut egui::Ui, text: RichText, width: f32| {
+        let label = egui::Label::new(text).truncate().halign(Align::LEFT).sense(Sense::click());
+        let shown = match width > 0.0 {
+            true => ui.add_sized(Vec2::new(width, 20.0), label),
+            false => ui.add(label),
+        };
+        if shown.on_hover_text("Show this in the code").clicked() {
+            take_me_there = true;
+        }
+    };
+    frame.show(ui, |ui| {
+        if here {
+            let bar = Rect::from_min_size(
+                ui.max_rect().left_top() - Vec2::new(16.0, 3.0),
+                Vec2::new(2.0, ui.max_rect().height() + 6.0),
+            );
+            ui.painter().rect_filled(bar, 0, theme::AMBER);
+        }
+        match &knob.kind {
+            Kind::Number(num) => {
+                ui.horizontal(|ui| {
+                    name(ui, RichText::new(&knob.label).color(if here { theme::PAPER } else { theme::TEXT }), 62.0);
+                    if let Some(edit) = slider(ui, (index, 0), num, here) {
+                        row.edits.push(edit);
                     }
                 });
-            });
-        }
-        Kind::Spread { dist, per_point, names, from, to } => {
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::PAPER)).truncate());
-                let draw = format!("{}{dist}", if *per_point { "~~" } else { "~" });
-                ui.label(RichText::new(draw).monospace().small().color(theme::VERMILION));
-            });
-            ui.horizontal(|ui| {
+            }
+            Kind::Spread { dist, per_point, names, from, to } => {
+                ui.horizontal(|ui| {
+                    name(ui, RichText::new(&knob.label).color(theme::PAPER), 0.0);
+                    let draw = format!("{}{dist}", if *per_point { "~~" } else { "~" });
+                    ui.label(RichText::new(draw).monospace().small().color(theme::VERMILION));
+                });
                 for (slot, (name, num)) in [(names[0], from), (names[1], to)].into_iter().enumerate() {
-                    ui.label(RichText::new(name).small().color(theme::MUTED));
-                    if let Some(edit) = drag(ui, (index, slot + 1), num) {
-                        edits.push(edit);
-                    }
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            Vec2::new(62.0, 20.0),
+                            egui::Label::new(RichText::new(name).small().color(theme::MUTED)).halign(Align::LEFT),
+                        );
+                        if let Some(edit) = slider(ui, (index, slot + 1), num, here) {
+                            row.edits.push(edit);
+                        }
+                    });
                 }
-            });
-        }
-        Kind::Choose { options, body } => {
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::PAPER)).truncate());
-                ui.label(RichText::new("choose").monospace().small().color(theme::VERMILION));
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                for (k, option) in options.iter().enumerate() {
-                    let mine = editing.as_ref().is_some_and(|e| e.knob == knob.at && e.option == k);
-                    let mut text = match &editing {
-                        Some(e) if mine => e.text.clone(),
-                        _ => option.text.clone(),
-                    };
-                    let width = (text.chars().count() as f32 * 7.6 + 14.0).clamp(34.0, 180.0);
-                    let field = egui::TextEdit::singleline(&mut text)
-                        .font(FontId::monospace(12.0))
-                        .text_color(theme::AMBER)
-                        .desired_width(width)
-                        .margin(egui::Margin::symmetric(6, 3));
-                    let shown = ui.push_id((knob.at, k), |ui| ui.add(field)).inner;
-                    if shown.changed() {
-                        *editing = Some(Editing { knob: knob.at, option: k, text: text.clone() });
+            }
+            Kind::Choose { options, body } => {
+                let held = draws::held_at(options);
+                let can_hold = draws::can_hold(options);
+                let editing = row.editing_choice == Some(knob.at);
+                ui.horizontal(|ui| {
+                    name(ui, RichText::new(&knob.label).color(theme::PAPER), 0.0);
+                    if held.is_some() {
+                        egui::Frame::new()
+                            .fill(theme::VERMILION)
+                            .corner_radius(3)
+                            .inner_margin(egui::Margin::symmetric(6, 1))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("held").small().strong().color(theme::INK));
+                            });
                     }
-                    // The work is rewritten once the option is finished, so
-                    // that half-typed code never reaches it.
-                    if mine && shown.lost_focus() {
-                        if let Some(Editing { text, .. }) = editing.take() {
-                            if text != option.text && !text.trim().is_empty() {
-                                edits.push(Edit { at: option.at.clone(), text });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let pencil = egui::Button::new(RichText::new("…").small().color(if editing {
+                            theme::PAPER
+                        } else {
+                            theme::FAINT
+                        }))
+                        .frame(false);
+                        if ui.add(pencil).on_hover_text("Write the options out").clicked() {
+                            row.editing_choice = (!editing).then_some(knob.at);
+                        }
+                    });
+                });
+                if !editing {
+                    if let Some(k) = segmented(ui, knob.at, options, held, can_hold) {
+                        row.edits.extend(match held == Some(k) {
+                            true => draws::release(options),
+                            false => draws::hold(options, k),
+                        });
+                        row.selected = Some(knob.at);
+                    }
+                    return;
+                }
+                // Written out: the options as they stand in the code.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                    for (k, option) in options.iter().enumerate() {
+                        let mine = row.editing.as_ref().is_some_and(|e| e.knob == knob.at && e.option == k);
+                        let mut text = match &row.editing {
+                            Some(e) if mine => e.text.clone(),
+                            _ => option.text.clone(),
+                        };
+                        let width = (text.chars().count() as f32 * 7.6 + 14.0).clamp(34.0, 180.0);
+                        let field = egui::TextEdit::singleline(&mut text)
+                            .font(FontId::monospace(12.0))
+                            .text_color(theme::AMBER)
+                            .desired_width(width)
+                            .margin(egui::Margin::symmetric(6, 3));
+                        let shown = ui.push_id((knob.at, k), |ui| ui.add(field)).inner;
+                        if shown.changed() {
+                            row.editing = Some(Editing { knob: knob.at, option: k, text: text.clone() });
+                        }
+                        // The work is rewritten once the option is finished,
+                        // so that half-typed code never reaches it.
+                        if mine && shown.lost_focus() {
+                            if let Some(Editing { text, .. }) = row.editing.take() {
+                                if text != option.text && !text.trim().is_empty() {
+                                    row.edits.push(Edit { at: option.at.clone(), text });
+                                }
                             }
                         }
+                        let can_remove = body.is_some() && options.len() > 1;
+                        let cross = egui::Button::new(RichText::new("×").small().color(theme::FAINT)).frame(false);
+                        if ui.add_enabled(can_remove, cross).on_hover_text("Take this one out").clicked() {
+                            row.edits.extend(remove_option(source, options, k));
+                        }
                     }
-                    let can_remove = body.is_some() && options.len() > 1;
-                    let cross = egui::Button::new(RichText::new("×").small().color(theme::FAINT)).frame(false);
-                    if ui.add_enabled(can_remove, cross).on_hover_text("Take this one out").clicked() {
-                        edits.extend(draws::remove_option(source, options, k));
+                    if let Some(body) = body {
+                        if ui.button(RichText::new("+").small()).on_hover_text("One more, copied from the last").clicked() {
+                            row.edits.extend(add_option(source, options, body));
+                        }
                     }
-                }
-                if let Some(body) = body {
-                    if ui.button(RichText::new("+").small()).on_hover_text("One more, copied from the last").clicked() {
-                        edits.extend(draws::add_option(source, options, body));
-                    }
-                }
-            });
+                });
+            }
         }
+    });
+    if take_me_there {
+        row.selected = Some(knob.at);
+        row.reveal = Some(knob.at..knob.at + 1);
     }
 }
 
