@@ -59,8 +59,9 @@ number yourself are the same edit, and the preview redraws either way.
 Clicking the name of a control shows you the piece of code it owns.
 
 - A **number** is a slider, with its value beside it to type into. The slider
-  runs from 0 to 1 for a ratio and to twice its value otherwise; typing goes
-  further. A number keeps the shape it was written in: `80` stays whole,
+  runs from 0 to 1 for a ratio and to twice its value otherwise, and holds
+  that span until you let go, so one pull at most doubles a number; pull
+  again, or type, to go further. A number keeps the shape it was written in: `80` stays whole,
   `0.015` keeps its three decimals.
 - A **range** — `~between(0.5, 0.8)` — has a slider per end, which widens or
   narrows what the next edition may draw.

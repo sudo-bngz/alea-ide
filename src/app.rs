@@ -46,6 +46,8 @@ pub struct App {
     /// until it is finished: half-typed code would parse as nothing and the
     /// controls would vanish under the hand editing them.
     editing: Option<Editing>,
+    /// The slider the hand is on, and the span it started with.
+    dragging: Dragging,
     /// The choice whose options are being edited as text, and the row the
     /// hand is on.
     editing_choice: Option<usize>,
@@ -103,6 +105,7 @@ impl App {
             side: 512,
             offer: None,
             editing: None,
+            dragging: None,
             editing_choice: None,
             selected: None,
             knobs: Vec::new(),
@@ -869,6 +872,7 @@ impl App {
         let draws = knobs.iter().filter(|k| k.is_draw()).count();
         let mut row = Row {
             editing: self.editing.take(),
+            dragging: self.dragging.take(),
             editing_choice: self.editing_choice.take(),
             selected: self.selected,
             reveal: None,
@@ -939,6 +943,7 @@ impl App {
 
         self.knobs = knobs;
         self.editing = row.editing;
+        self.dragging = row.dragging;
         self.editing_choice = row.editing_choice;
         self.selected = row.selected;
         if let Some(at) = row.reveal {
@@ -1225,6 +1230,7 @@ fn entry_card(ui: &mut egui::Ui, entry: &Entry, compact: bool) {
 /// What a row of controls may hand back to the pane.
 struct Row {
     editing: Option<Editing>,
+    dragging: Dragging,
     editing_choice: Option<usize>,
     selected: Option<usize>,
     /// A piece of code to put the cursor on.
@@ -1235,9 +1241,10 @@ struct Row {
 /// One number as a slider and its value, in the shape the code writes it.
 /// The value shown is read out of the source every frame; moving the
 /// handle writes a new one back.
-fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool) -> Option<Edit> {
+fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, dragging: &mut Dragging) -> Option<Edit> {
+    let track = track_for(num, id, dragging);
     let mut value = num.value;
-    let widget = egui::Slider::new(&mut value, num.track())
+    let widget = egui::Slider::new(&mut value, track.clone())
         .fixed_decimals(num.decimals)
         .clamping(egui::SliderClamping::Never)
         .trailing_fill(true)
@@ -1253,7 +1260,30 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool) -> Opt
             ui.add(widget)
         })
         .inner;
+    // While the hand is down, this is the track; the moment it lifts, the
+    // slider goes back to spanning whatever the number now reads.
+    match shown.dragged() {
+        true => *dragging = Some((id, track)),
+        false if dragging.as_ref().is_some_and(|(held, _)| *held == id) => *dragging = None,
+        false => {}
+    }
     (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) })
+}
+
+/// Which slider is being dragged, and the span it had when the drag began.
+type Dragging = Option<((usize, usize), std::ops::RangeInclusive<f64>)>;
+
+/// The span a slider runs along. A slider writes its value into the code,
+/// and the pane reads the code again every frame, so a span worked out from
+/// the value would grow as the value grows, which moves the handle back
+/// under the pointer and makes the next frame grow it again: dragging to
+/// the right would run away. Once a drag starts, the span it started with
+/// is the span it keeps.
+fn track_for(num: &Num, id: (usize, usize), dragging: &Dragging) -> std::ops::RangeInclusive<f64> {
+    match dragging {
+        Some((held, track)) if *held == id => track.clone(),
+        _ => num.track(),
+    }
 }
 
 /// The options of a choice, side by side. Clicking one holds the choice
@@ -1313,7 +1343,7 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
             Kind::Number(num) => {
                 ui.horizontal(|ui| {
                     name(ui, RichText::new(&knob.label).color(if here { theme::PAPER } else { theme::TEXT }), 62.0);
-                    if let Some(edit) = slider(ui, (index, 0), num, here) {
+                    if let Some(edit) = slider(ui, (index, 0), num, here, &mut row.dragging) {
                         row.edits.push(edit);
                     }
                 });
@@ -1330,7 +1360,7 @@ fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, row: &mu
                             Vec2::new(62.0, 20.0),
                             egui::Label::new(RichText::new(name).small().color(theme::MUTED)).halign(Align::LEFT),
                         );
-                        if let Some(edit) = slider(ui, (index, slot + 1), num, here) {
+                        if let Some(edit) = slider(ui, (index, slot + 1), num, here, &mut row.dragging) {
                             row.edits.push(edit);
                         }
                     });
@@ -1432,6 +1462,37 @@ mod tests {
         for src in [STARTER, "work Été {\n  let a = \"open", "", "~~"] {
             assert_eq!(highlight(src, &font).text, src);
         }
+    }
+
+    #[test]
+    fn a_slider_keeps_its_span_while_it_is_dragged() {
+        let number = |value: f64| Num { value, at: 0..2, decimals: 0 };
+        let (mine, other) = ((0, 0), (1, 0));
+        let held: Dragging = Some((mine, 0.0..=160.0));
+        // The value has moved on since the drag began; the span has not.
+        assert_eq!(track_for(&number(120.0), mine, &held), 0.0..=160.0);
+        // Another slider is not affected, and neither is this one once the
+        // hand lifts.
+        assert_eq!(track_for(&number(120.0), other, &held), 0.0..=240.0);
+        assert_eq!(track_for(&number(120.0), mine, &None), 0.0..=240.0);
+    }
+
+    #[test]
+    fn dragging_to_the_right_does_not_run_away() {
+        // The pointer is held still at seven tenths along the track, which
+        // is what a hand does at the end of a drag. Every frame the value
+        // is written to the code and read back, and the span is worked out
+        // again: it must not grow under the pointer.
+        let id = (0, 0);
+        let mut dragging: Dragging = None;
+        let mut value = 80.0;
+        for _ in 0..24 {
+            let num = Num { value, at: 0..2, decimals: 0 };
+            let track = track_for(&num, id, &dragging);
+            dragging = Some((id, track.clone()));
+            value = track.start() + (track.end() - track.start()) * 0.7;
+        }
+        assert_eq!(value, 112.0, "the pointer never moved, so neither should the value");
     }
 
     #[test]
