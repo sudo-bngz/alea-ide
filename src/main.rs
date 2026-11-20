@@ -10,6 +10,7 @@ mod complete;
 mod doc;
 mod draws;
 mod engine;
+mod export;
 mod reference;
 mod theme;
 

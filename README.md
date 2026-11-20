@@ -22,10 +22,35 @@ and reroll the seed until one is worth keeping.
   click a thumbnail to go back, or type a seed to return to a known edition.
   Thumbnails drawn from older code are faded.
 - **Keep.** Kept editions are never dropped from the history.
-- **Export PNG.** Writes the edition on screen at the size the work asks
-  for, named `<work>-<seed>.png` like the command line does.
+- **Export.** Opens a dialog: what to write, in which format, at which size,
+  and for which editions. See below.
 
 The same seed draws the same edition here and with `alea work.alea --seed N`.
+
+## Export
+
+![The export dialog](docs/export.png)
+
+**Export…** opens a dialog set to what the work asks for, and nothing is
+written until you say so.
+
+| Render | Formats | What you can set |
+| --- | --- | --- |
+| `image` | PNG, JPEG | size (proportions kept unless you say otherwise), JPEG quality |
+| `video` | GIF, MP4 | size, frames a second (it says how many frames that makes) |
+| `sound` | WAV | — |
+| `midi` | MIDI | — |
+| `sculpture` | STL | — |
+
+Everything but the MP4 is written by the IDE itself, so nothing has to be
+installed. An MP4 is handed to ffmpeg, as the command line does, with the
+work's sound on it; without ffmpeg on the machine that one format is greyed
+out and the rest still work.
+
+**Editions**: this one, or every edition you marked *Keep* in this tab — one
+file each, named by its seed, so a sheet of editions comes out in one go.
+The line above the buttons says what will be written, and a bar says where
+the run has got to.
 
 ## Loops
 

@@ -53,6 +53,7 @@ dependencies = [
  "alea-lang",
  "eframe",
  "egui",
+ "hound",
  "image",
  "qell-core",
  "rand",

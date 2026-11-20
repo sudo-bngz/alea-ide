@@ -20,7 +20,9 @@ qell-core = { git = "https://github.com/sudo-bngz/qell" }
 egui = "0.33"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.18"
-image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+# Writing WAV, for a sound render and for an MP4's audio track.
+hound = "3.5"
 rand = "0.9"
 
 [profile.release]
