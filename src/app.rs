@@ -504,6 +504,7 @@ impl App {
             tab.busy = !reply.last;
             match reply.outcome {
                 Outcome::Image(p) => {
+                    tab.music = None;
                     let version = tab.asked.as_ref().map_or(0, |a| a.0);
                     let image = ColorImage::from_rgb([p.width, p.height], &p.rgb);
                     tab.image = Some(ctx.load_texture(format!("edition-{}", tab.id), image, TextureOptions::LINEAR));
@@ -523,6 +524,7 @@ impl App {
                     tab.follow();
                 }
                 Outcome::Clip(clip) => {
+                    tab.music = None;
                     tab.clip = Some(Clip::new(clip.width, clip.height, clip.fps, clip.asked_fps, clip.duration, clip.frames));
                     tab.image_px = (clip.width, clip.height);
                     tab.full = clip.full;
@@ -546,10 +548,18 @@ impl App {
                         }
                     }
                 }
+                Outcome::Music(summary, music) => {
+                    tab.summary = Some(summary);
+                    tab.music = Some(music);
+                    tab.clip = None;
+                    tab.failure = None;
+                    tab.note = None;
+                }
                 Outcome::Nothing(summary, what) => {
                     tab.summary = Some(summary);
                     tab.image = None;
                     tab.clip = None;
+                    tab.music = None;
                     tab.failure = None;
                     tab.note = Some(what);
                     tab.follow();
@@ -1397,6 +1407,11 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WELL)).show(ctx, |ui| {
             let tab = &self.tabs[self.active];
             header(ui, "RENDERS", |ui| {
+                if let (true, Some(music)) = (matches!(shown.as_str(), "sound" | "midi"), &tab.music) {
+                    let bars = music.beats() / 4.0;
+                    let text = format!("{:.0} bpm · {bars:.0} bars · {:.1} s", music.tempo, music.duration);
+                    ui.label(RichText::new(text).small().monospace().color(theme::MUTED));
+                }
                 match (&tab.clip, &tab.image) {
                     (Some(clip), _) => {
                         let text = format!("{} × {} · {:.0} fps · {:.1} s", tab.full.0, tab.full.1, clip.fps, clip.duration);
@@ -1462,6 +1477,10 @@ impl App {
             self.side = px.div_ceil(128) * 128;
 
             let tab = &self.tabs[self.active];
+            if let (true, Some(music)) = (matches!(shown.as_str(), "sound" | "midi"), &tab.music) {
+                roll(ui, music, area);
+                return;
+            }
             let dim = tab.failure.is_some();
             let shot = match (shown.as_str(), &tab.clip, &tab.image) {
                 ("video", Some(clip), _) => clip.at(tab.position).map(|frame| (frame, clip.width, clip.height)),
@@ -1668,6 +1687,86 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, draggi
     (edit, shown.dragged() || shown.changed() || pressed_on_it)
 }
 
+/// The music of a work laid out in time: a lane per layer, notes where
+/// they fall, and a knob's turns as a line.
+fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect) {
+    use crate::score::Lane;
+    const NAMES: f32 = 96.0;
+    // A lane for each layer, and a strip at the top for the bar numbers.
+    let bars = Rect::from_min_size(area.min, Vec2::new(area.width(), 18.0));
+    let body = Rect::from_min_max(egui::pos2(area.left(), bars.bottom()), area.max);
+    let roll = Rect::from_min_max(egui::pos2(body.left() + NAMES, body.top()), body.max);
+    let painter = ui.painter();
+
+    let beats = music.beats().max(1.0);
+    let per_beat = roll.width() / beats as f32;
+    let at = |t: f64| roll.left() + (t / music.duration.max(0.001)) as f32 * roll.width();
+
+    // The grid: a line a beat, a brighter one and a number every four,
+    // which is how most of this music is counted.
+    let mut beat = 0.0;
+    while beat <= beats + 0.001 {
+        let x = roll.left() + beat as f32 * per_beat;
+        let bar = (beat as usize).is_multiple_of(4);
+        let ink = if bar { theme::LINE } else { theme::LINE.gamma_multiply(0.45) };
+        painter.vline(x, body.y_range(), Stroke::new(1.0_f32, ink));
+        if bar && per_beat > 6.0 {
+            let number = beat as usize / 4 + 1;
+            painter.text(egui::pos2(x + 4.0, bars.top()), Align2::LEFT_TOP, number, FontId::monospace(11.0), theme::FAINT);
+        }
+        beat += 1.0;
+    }
+
+    let colours = [theme::VERMILION, theme::AMBER, theme::MIST, theme::MOSS, theme::CLAY, theme::BLUSH];
+    let height = (body.height() / music.lanes.len().max(1) as f32).min(120.0);
+    for (k, (name, lane)) in music.lanes.iter().enumerate() {
+        let top = body.top() + k as f32 * height;
+        let row = Rect::from_min_size(egui::pos2(body.left(), top), Vec2::new(body.width(), height));
+        if k % 2 == 1 {
+            painter.rect_filled(row, 0, theme::INK.gamma_multiply(0.5));
+        }
+        let ink = colours[k % colours.len()];
+        // `notes - pluck` reads better as `pluck` in a narrow column.
+        let shown = name.rsplit(" - ").next().unwrap_or(name);
+        painter.text(
+            egui::pos2(body.left() + 10.0, row.center().y),
+            Align2::LEFT_CENTER,
+            shown,
+            FontId::proportional(12.0),
+            theme::TEXT,
+        );
+
+        let inside = Rect::from_min_max(egui::pos2(roll.left(), top + 4.0), egui::pos2(roll.right(), top + height - 4.0));
+        match lane {
+            Lane::Notes { notes, low, high } => {
+                // Each lane is drawn against its own range, so a bass line
+                // and a hi-hat are both worth looking at.
+                let span = (*high as f32 - *low as f32) + 1.0;
+                let tall = (inside.height() / span).clamp(2.0, 10.0);
+                for note in notes {
+                    let step = (note.pitch as f32 - *low as f32 + 0.5) / span;
+                    let y = inside.bottom() - step * inside.height();
+                    let (from, to) = (at(note.at), at(note.until));
+                    let block = Rect::from_min_size(egui::pos2(from, y - tall / 2.0), Vec2::new((to - from).max(3.0), tall));
+                    let loud = 0.35 + 0.65 * note.velocity as f32 / 127.0;
+                    painter.rect_filled(block, 1, ink.gamma_multiply(loud));
+                }
+            }
+            Lane::Silent => {
+                let at = egui::pos2(inside.left() + 6.0, row.center().y);
+                painter.text(at, Align2::LEFT_CENTER, "silent in this edition", FontId::proportional(11.0), theme::FAINT);
+            }
+            Lane::Turns { points, .. } => {
+                let line: Vec<Pos2> = points
+                    .iter()
+                    .map(|(t, value)| egui::pos2(at(*t), inside.bottom() - *value as f32 * inside.height()))
+                    .collect();
+                painter.add(egui::Shape::line(line, Stroke::new(1.5_f32, ink)));
+            }
+        }
+    }
+}
+
 /// A number of the work, shown on the canvas where it means something.
 struct Handle {
     /// The knob it writes to, so the canvas and the pane agree on what is
@@ -1708,27 +1807,44 @@ fn track_for(num: &Num, id: (usize, usize), dragging: &Dragging) -> std::ops::Ra
 /// there; clicking the one it is held at lets it go again.
 fn segmented(ui: &mut egui::Ui, id: usize, options: &[Opt], held: Option<usize>, can_hold: bool) -> Option<usize> {
     let mut clicked = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
-        for (k, option) in options.iter().enumerate() {
-            let on = held == Some(k);
-            let shown = option.text.trim_matches('"');
-            let text = RichText::new(shown).monospace().size(12.0).color(if on { theme::INK } else { theme::TEXT });
-            let button = egui::Button::new(text)
-                .fill(if on { theme::PAPER } else { theme::BAR })
-                .stroke(Stroke::new(1.0_f32, if on { theme::PAPER } else { theme::EDGE }))
-                .corner_radius(3)
-                .min_size(Vec2::new(30.0, 24.0));
-            let hint = match (can_hold, on) {
-                (false, _) => "This choice is weighted in the code".to_string(),
-                (true, true) => "Let this choice go: every edition draws its own again".to_string(),
-                (true, false) => format!("Hold this choice at {shown} for every edition"),
-            };
-            if ui.push_id((id, k), |ui| ui.add_enabled(can_hold, button)).inner.on_hover_text(hint).clicked() {
-                clicked = Some(k);
+    // Options that are whole lines of code go one per line; short ones sit
+    // side by side like a row of switches.
+    let wide = options.iter().any(|o| o.text.chars().count() > 12);
+    let each = |ui: &mut egui::Ui, mut draw: Box<dyn FnMut(&mut egui::Ui) + '_>| match wide {
+        true => ui.vertical(|ui| draw(ui)),
+        false => ui.horizontal_wrapped(|ui| draw(ui)),
+    };
+    each(
+        ui,
+        Box::new(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
+            for (k, option) in options.iter().enumerate() {
+                let on = held == Some(k);
+                let whole = option.text.trim_matches('"');
+                // An option can be a whole line of code: show its beginning.
+                let room = if wide { 32 } else { 18 };
+                let shown: String = match whole.chars().count() > room {
+                    true => whole.chars().take(room - 1).chain(std::iter::once('…')).collect(),
+                    false => whole.to_string(),
+                };
+                let shown = shown.as_str();
+                let text = RichText::new(shown).monospace().size(12.0).color(if on { theme::INK } else { theme::TEXT });
+                let button = egui::Button::new(text)
+                    .fill(if on { theme::PAPER } else { theme::BAR })
+                    .stroke(Stroke::new(1.0_f32, if on { theme::PAPER } else { theme::EDGE }))
+                    .corner_radius(3)
+                    .min_size(Vec2::new(30.0, 24.0));
+                let hint = match (can_hold, on) {
+                    (false, _) => format!("{whole}\n\nThis choice is weighted in the code"),
+                    (true, true) => format!("{whole}\n\nLet this choice go: every edition draws its own again"),
+                    (true, false) => format!("{whole}\n\nHold this choice here for every edition"),
+                };
+                if ui.push_id((id, k), |ui| ui.add_enabled(can_hold, button)).inner.on_hover_text(hint).clicked() {
+                    clicked = Some(k);
+                }
             }
-        }
-    });
+        }),
+    );
     clicked
 }
 

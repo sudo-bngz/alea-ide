@@ -47,6 +47,8 @@ pub enum Outcome {
     /// The shape of a loop. Its frames follow, one reply each.
     Clip(Clip),
     Frame(Frame),
+    /// What the work plays, as lanes of notes.
+    Music(Summary, crate::score::Music),
     /// The work is fine, but this is not something the viewport can show.
     Nothing(Summary, String),
     Failed(Failure),
@@ -266,8 +268,19 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
             }
             continue;
         }
+        if job.shown == "sound" || job.shown == "midi" {
+            match guarded(&job, || Ok(media::live_score(&ed).transpose()?.map(|score| crate::score::read(&score)))) {
+                Ok(Some(music)) if !music.is_empty() => send(true, Outcome::Music(summary, music)),
+                Ok(_) => {
+                    let what = "This work's sound is made of fields rather than notes, so there is nothing to lay out.";
+                    send(true, Outcome::Nothing(summary, what.into()));
+                }
+                Err(f) => send(true, Outcome::Failed(f)),
+            }
+            continue;
+        }
         if job.shown != "image" {
-            let what = format!("The viewport shows `image` and `video` for now, not `{}`.", job.shown);
+            let what = format!("The viewport shows pictures, loops and music for now, not `{}`.", job.shown);
             send(true, Outcome::Nothing(summary, what));
             continue;
         }
