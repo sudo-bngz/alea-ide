@@ -25,6 +25,7 @@ image = { version = "0.25", default-features = false, features = ["png", "gif", 
 hound = "3.5"
 rand = "0.9"
 cpal = "0.18.2"
+midir = "0.11"
 
 [profile.release]
 opt-level = 3

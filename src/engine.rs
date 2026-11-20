@@ -47,8 +47,9 @@ pub enum Outcome {
     /// The shape of a loop. Its frames follow, one reply each.
     Clip(Clip),
     Frame(Frame),
-    /// What the work plays, as lanes of notes.
-    Music(Summary, crate::score::Music),
+    /// What the work plays, as lanes of notes — and as the score itself,
+    /// which is what goes out to the instruments.
+    Music(Summary, crate::score::Music, Arc<alea::midi::Score>),
     /// The same music as samples, which takes a moment longer to render
     /// than the lanes do and so comes after them.
     Sound(crate::sound::Take),
@@ -283,8 +284,9 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
             // The lanes first: they are quick, and they are what the roll
             // is drawn from. The samples take a moment longer and follow.
             let heard = ed.renders.iter().any(|r| r.kind == "sound");
-            match guarded(&job, || Ok(media::live_score(&ed).transpose()?.map(|score| crate::score::read(&score)))) {
-                Ok(Some(music)) if !music.is_empty() => send(!heard, Outcome::Music(summary, music)),
+            let read = || Ok(media::live_score(&ed).transpose()?.map(|score| (crate::score::read(&score), Arc::new(score))));
+            match guarded(&job, read) {
+                Ok(Some((music, score))) if !music.is_empty() => send(!heard, Outcome::Music(summary, music, score)),
                 Ok(_) => {
                     let what = "This work's sound is made of fields rather than notes, so there is nothing to lay out.";
                     send(true, Outcome::Nothing(summary, what.into()));

@@ -17,6 +17,7 @@ use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, EXAMPLES,
 use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, OnCanvas, Opt};
 use crate::engine::{Engine, Job, Outcome, Preview};
 use crate::export::{self, Format, Options, Progress};
+use crate::midiout::{Desk, Route};
 use crate::reference::{self, Entry};
 use crate::sound::Speaker;
 use crate::steps::{self, Pattern, Tap};
@@ -79,6 +80,14 @@ pub struct App {
     /// of its editions.
     speaker: Speaker,
     sounding: Option<(u64, u64)>,
+    /// The way out to the instruments, the ports it can see, and whether
+    /// the panel that points the lanes at them is open.
+    desk: Desk,
+    ports: Vec<String>,
+    midi_open: bool,
+    /// What was last sent out, so that a new edition or a lane moved to
+    /// another instrument is noticed.
+    sent: Option<(u64, u64)>,
 }
 
 /// The completion list, as it stands between two frames.
@@ -145,6 +154,10 @@ impl App {
             reference: None,
             speaker: Speaker::new(),
             sounding: None,
+            desk: Desk::new(),
+            ports: Vec::new(),
+            midi_open: false,
+            sent: None,
         };
         match file {
             Some(path) => app.open(path),
@@ -282,6 +295,99 @@ impl App {
             });
             let _ = done.send(said);
         });
+    }
+
+    /// Where each layer plays: the lanes of the roll, each pointed at an
+    /// instrument of its own, the way a DAW points a track at an output.
+    fn midi_dialog(&mut self, ctx: &Context) {
+        if !self.midi_open {
+            return;
+        }
+        let lanes: Vec<String> = match &self.tabs[self.active].music {
+            Some(music) => music.lanes.iter().map(|(name, _)| name.clone()).collect(),
+            None => Vec::new(),
+        };
+        let frame = egui::Frame::new()
+            .fill(theme::PANEL)
+            .stroke(Stroke::new(1.0_f32, theme::EDGE))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(20, 16));
+        let (mut close, mut refresh, mut panic) = (false, false, false);
+        let answer = egui::Modal::new(Id::new("midi")).frame(frame).show(ctx, |ui| {
+            ui.set_width(540.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MIDI out").size(16.0).strong().color(theme::PAPER));
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    refresh = ui.button("Look again").on_hover_text("Ask the machine for its ports again").clicked();
+                });
+            });
+            ui.add_space(4.0);
+            let says = "Each layer can play on an instrument of its own. alea gives every layer a channel already; \
+                        “as written” keeps it.";
+            ui.label(RichText::new(says).small().color(theme::MUTED));
+            ui.add_space(12.0);
+
+            if lanes.is_empty() {
+                ui.label(RichText::new("This work has no lanes to send.").color(theme::MUTED));
+            }
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                egui::Grid::new("routes").num_columns(3).spacing([10.0, 8.0]).show(ui, |ui| {
+                    for lane in &lanes {
+                        let route = self.tabs[self.active].routes.entry(lane.clone()).or_default();
+                        ui.label(RichText::new(lane_name(lane)).color(theme::TEXT));
+                        let shown = route.to.shown();
+                        egui::ComboBox::from_id_salt(("to", lane)).selected_text(shown).width(260.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut route.to, crate::midiout::To::Nowhere, "nowhere");
+                            ui.selectable_value(&mut route.to, crate::midiout::To::Text, "as words, on the terminal")
+                                .on_hover_text("No instrument: the messages written out, to see what the lane sends");
+                            let ours = format!("{} — a port of our own", crate::midiout::OURS);
+                            ui.selectable_value(&mut route.to, crate::midiout::To::Ours, ours)
+                                .on_hover_text("A port this studio offers: open it in a DAW or an instrument to listen in");
+                            for port in &self.ports {
+                                ui.selectable_value(&mut route.to, crate::midiout::To::Port(port.clone()), port);
+                            }
+                        });
+                        let channel = match route.channel {
+                            Some(c) => format!("ch {c}"),
+                            None => "as written".to_string(),
+                        };
+                        egui::ComboBox::from_id_salt(("ch", lane)).selected_text(channel).width(110.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut route.channel, None, "as written");
+                            for c in 1..=16u8 {
+                                ui.selectable_value(&mut route.channel, Some(c), format!("ch {c}"));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                let tab = &mut self.tabs[self.active];
+                ui.checkbox(&mut tab.monitor, "play it here as well")
+                    .on_hover_text("Off, the instruments play it and this machine stays quiet");
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.button("Done").clicked();
+                    panic = ui.button("Panic").on_hover_text("Silence every note, everywhere").clicked();
+                });
+            });
+            if let Some(why) = self.desk.trouble() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(why).small().color(theme::VERMILION));
+            }
+        });
+        if refresh {
+            self.ports = crate::midiout::ports();
+        }
+        if panic {
+            self.desk.stop();
+        }
+        if close || answer.should_close() {
+            self.midi_open = false;
+        }
+        // Moving a lane while it plays takes effect at once, as on a desk.
+        self.reroute();
     }
 
     /// The dialog itself.
@@ -559,7 +665,7 @@ impl App {
                         }
                     }
                 }
-                Outcome::Music(summary, music) => {
+                Outcome::Music(summary, music, score) => {
                     let version = tab.asked.as_ref().map_or(0, |a| a.0);
                     let name = format!("thumb-{}-{:x}", tab.id, tab.seed);
                     let thumb = ctx.load_texture(name, sketch(&music), TextureOptions::NEAREST);
@@ -568,6 +674,7 @@ impl App {
                     }
                     tab.summary = Some(summary);
                     tab.music = Some(music);
+                    tab.score = Some(score);
                     tab.clip = None;
                     tab.failure = None;
                     tab.note = None;
@@ -603,6 +710,42 @@ impl App {
         }
     }
 
+    /// The lanes of the work on screen, in the order the score sends them,
+    /// each with where it has been pointed.
+    fn routes(&self) -> Vec<Route> {
+        let tab = &self.tabs[self.active];
+        let Some(music) = &tab.music else { return Vec::new() };
+        music.lanes.iter().map(|(name, _)| tab.routes.get(name).cloned().unwrap_or_default()).collect()
+    }
+
+    /// Tells the desk where the lanes go now, without stopping what plays.
+    fn reroute(&mut self) {
+        if self.desk.playing() {
+            self.desk.route(self.routes());
+        }
+    }
+
+    /// Starts, or stops, everything the transport reaches: this machine's
+    /// speakers and whatever instruments the lanes are pointed at.
+    fn transport(&mut self, on: bool) {
+        let tab = &self.tabs[self.active];
+        let (monitor, score) = (tab.monitor, tab.score.clone());
+        let routes = self.routes();
+        let sends = routes.iter().any(Route::sends);
+        match (on, sends, score) {
+            (true, true, Some(score)) => {
+                self.desk.play(score, routes);
+                self.sent = Some((self.tabs[self.active].id, self.tabs[self.active].heard));
+            }
+            (false, ..) => self.desk.stop(),
+            _ => {}
+        }
+        match on && (monitor || !sends) {
+            true => self.speaker.play(),
+            false => self.speaker.hold(),
+        }
+    }
+
     /// Keeps the speaker on the music in front of the eyes: the active
     /// tab's, as of its latest edition. A new edition of the same work
     /// slips in without stopping, which is what makes a knob or a step
@@ -622,8 +765,26 @@ impl App {
             }
             self.sounding = want;
         }
-        if !listening && self.speaker.playing() {
-            self.speaker.hold();
+        // The instruments are sent the same editions as the speaker.
+        let out = self.tabs[self.active].score.as_ref().map(|_| (tab.id, tab.heard));
+        if self.desk.playing() && self.sent != out {
+            match (out.map(|(id, _)| id) == self.sent.map(|(id, _)| id), &self.tabs[self.active].score) {
+                // The same work, a new edition: it takes over where this one is.
+                (true, Some(score)) => self.desk.swap(Arc::clone(score)),
+                _ => self.desk.stop(),
+            }
+            self.sent = out;
+        }
+        if !listening {
+            if self.speaker.playing() {
+                self.speaker.hold();
+            }
+            if self.desk.playing() {
+                self.desk.stop();
+            }
+        }
+        if self.desk.playing() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         if self.speaker.playing() {
             // The playhead moves between edits, so the roll is redrawn.
@@ -1460,6 +1621,7 @@ impl App {
         let mut play = None;
         let mut seek = None;
         let (mut hear, mut rewind, mut scrub_to) = (None, false, None);
+        let mut open_midi = false;
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WELL)).show(ctx, |ui| {
             let tab = &self.tabs[self.active];
@@ -1510,7 +1672,7 @@ impl App {
                     let ready = tab.take.is_some();
                     let sounds = tab.summary.as_ref().is_some_and(|s| s.renders.iter().any(|k| k == "sound"));
                     ui.horizontal(|ui| {
-                        let on = self.speaker.playing();
+                        let on = self.speaker.playing() || self.desk.playing();
                         let mark = if on { "Hold" } else { "Play" };
                         let button = egui::Button::new(RichText::new(mark).strong().color(theme::INK))
                             .fill(if ready { theme::PAPER } else { theme::LINE })
@@ -1528,7 +1690,7 @@ impl App {
                             rewind = true;
                         }
                         let mut position = if duration > 0.0 { self.speaker.at() / duration } else { 0.0 };
-                        ui.spacing_mut().slider_width = (ui.available_width() - 150.0).max(80.0);
+                        ui.spacing_mut().slider_width = (ui.available_width() - 280.0).max(80.0);
                         ui.visuals_mut().selection.bg_fill = theme::VERMILION;
                         ui.visuals_mut().widgets.inactive.bg_fill = theme::LINE;
                         let scrub = egui::Slider::new(&mut position, 0.0..=1.0).show_value(false);
@@ -1545,6 +1707,20 @@ impl App {
                         if let Some(why) = why {
                             said.on_hover_text(why);
                         }
+                        // Where the lanes play, if not here.
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let sends = self.routes().iter().filter(|r| r.sends()).count();
+                            let mark = match sends {
+                                0 => "MIDI out…".to_string(),
+                                1 => "MIDI out · 1 lane".to_string(),
+                                n => format!("MIDI out · {n} lanes"),
+                            };
+                            let colour = if sends > 0 { theme::AMBER } else { theme::TEXT };
+                            let button = egui::Button::new(RichText::new(mark).small().color(colour)).fill(theme::BAR);
+                            if ui.add(button).on_hover_text("Send each lane to an instrument of its own").clicked() {
+                                open_midi = true;
+                            }
+                        });
                     });
                 });
             }
@@ -1588,7 +1764,10 @@ impl App {
 
             let tab = &self.tabs[self.active];
             if let (true, Some(music)) = (matches!(shown.as_str(), "sound" | "midi"), &tab.music) {
-                let playhead = tab.take.as_ref().map(|_| self.speaker.at());
+                let playhead = match (self.speaker.playing(), self.desk.playing()) {
+                    (false, true) => Some(self.desk.at() % music.duration.max(0.001)),
+                    _ => tab.take.as_ref().map(|_| self.speaker.at()),
+                };
                 let (scrubbed, tapped) = roll(ui, music, area, playhead, &self.patterns);
                 scrub_to = scrubbed;
                 edits.extend(tapped);
@@ -1622,13 +1801,16 @@ impl App {
             }
         });
 
-        match hear {
-            Some(true) => self.speaker.play(),
-            Some(false) => self.speaker.hold(),
-            None => {}
+        if open_midi {
+            self.ports = crate::midiout::ports();
+            self.midi_open = true;
+        }
+        if let Some(on) = hear {
+            self.transport(on);
         }
         if rewind {
             self.speaker.rewind();
+            self.desk.stop();
         }
         if let Some(seconds) = scrub_to {
             self.speaker.seek(seconds);
@@ -1664,6 +1846,7 @@ impl eframe::App for App {
         self.viewport(ctx);
         self.offer_list(ctx);
         self.export_dialog(ctx);
+        self.midi_dialog(ctx);
         self.play(ctx);
         self.listen(ctx);
         self.request(ctx);
@@ -1918,7 +2101,7 @@ fn roll(
         }
         let ink = colours[k % colours.len()];
         // `notes - pluck` reads better as `pluck` in a narrow column.
-        let shown = name.rsplit(" - ").next().unwrap_or(name);
+        let shown = lane_name(name);
         painter.text(
             egui::pos2(body.left() + 10.0, row.center().y),
             Align2::LEFT_CENTER,
@@ -1991,6 +2174,13 @@ fn roll(
         painter.add(egui::Shape::convex_polygon(head.to_vec(), theme::VERMILION, Stroke::NONE));
     }
     (seek, edits)
+}
+
+/// A lane's name as the studio says it: alea names a track after the kind
+/// of layer and what plays it ("notes - pluck"); the player is the part
+/// worth reading.
+fn lane_name(name: &str) -> &str {
+    name.rsplit(" - ").next().unwrap_or(name)
 }
 
 /// How many bars the music lasts, which is how often a written pattern

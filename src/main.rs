@@ -11,6 +11,7 @@ mod doc;
 mod draws;
 mod engine;
 mod export;
+mod midiout;
 mod reference;
 mod score;
 mod sound;
