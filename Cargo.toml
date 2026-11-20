@@ -14,9 +14,8 @@ path = "src/main.rs"
 [dependencies]
 # The language itself: parser, evaluator and renderers (the library is `alea`).
 alea-lang = { git = "https://github.com/sudo-bngz/alea" }
-# Qell's editor core, for the highlighting and its theme.
-# TODO: back to the default branch once sudo-bngz/qell#1 is merged.
-qell-core = { git = "https://github.com/sudo-bngz/qell", branch = "feat/alea-highlighting" }
+# Qell's editor core, for the alea syntax highlighting.
+qell-core = { git = "https://github.com/sudo-bngz/qell" }
 
 egui = "0.33"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
