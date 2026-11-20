@@ -13,7 +13,7 @@ use egui::{
 };
 
 use crate::complete::{self, Candidate};
-use crate::doc::{format_seed, parse_seed, random_seed, Doc, Tab, STARTER};
+use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, STARTER};
 use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, Opt};
 use crate::engine::{self, Engine, Job, Outcome, Preview};
 use crate::reference::{self, Entry};
@@ -24,7 +24,7 @@ const DEBOUNCE: Duration = Duration::from_millis(140);
 /// Longest side of a history thumbnail, in pixels.
 const THUMB: usize = 144;
 
-type Exported = Result<PathBuf, String>;
+type Exported = Result<String, String>;
 
 pub struct App {
     docs: Vec<Doc>,
@@ -185,6 +185,7 @@ impl App {
         let doc = &self.docs[tab.doc];
         Job {
             id,
+            shown: tab.shown.clone(),
             source: Arc::from(doc.text.as_str()),
             file: doc.file_name(),
             dir: doc.dir(),
@@ -198,15 +199,19 @@ impl App {
             return;
         }
         let tab = &self.tabs[self.active];
-        let Some(dir) =
-            rfd::FileDialog::new().set_title("Export this edition to…").set_directory(self.docs[tab.doc].dir()).pick_folder()
-        else {
+        let (loop_, kind) = (tab.shown == "video", tab.shown.clone());
+        let title = if loop_ { "Export this loop as a GIF to…" } else { "Export this edition to…" };
+        let Some(dir) = rfd::FileDialog::new().set_title(title).set_directory(self.docs[tab.doc].dir()).pick_folder() else {
             return;
         };
         let (job, done) = (self.job(tab, 0), self.exports.0.clone());
         self.exporting = true;
         std::thread::spawn(move || {
-            let _ = done.send(engine::export_png(&job, &dir));
+            let said = match kind.as_str() {
+                "video" => engine::export_gif(&job, &dir).map(|(path, how)| format!("Exported {} — {how}", path.display())),
+                _ => engine::export_png(&job, &dir).map(|path| format!("Exported {}", path.display())),
+            };
+            let _ = done.send(said);
         });
     }
 
@@ -219,12 +224,13 @@ impl App {
             tab.busy = !reply.last;
             match reply.outcome {
                 Outcome::Image(p) => {
-                    let version = tab.asked.map_or(0, |a| a.0);
+                    let version = tab.asked.as_ref().map_or(0, |a| a.0);
                     let image = ColorImage::from_rgb([p.width, p.height], &p.rgb);
                     tab.image = Some(ctx.load_texture(format!("edition-{}", tab.id), image, TextureOptions::LINEAR));
                     tab.image_px = (p.width, p.height);
                     tab.full = p.full;
                     tab.failure = None;
+                    tab.note = None;
                     if reply.last {
                         tab.elapsed = Some(p.elapsed);
                         let thumb =
@@ -234,20 +240,49 @@ impl App {
                         }
                     }
                     tab.summary = Some(p.summary);
+                    tab.follow();
                 }
-                Outcome::NoImage(summary) => {
+                Outcome::Clip(clip) => {
+                    tab.clip = Some(Clip::new(clip.width, clip.height, clip.fps, clip.duration, clip.frames));
+                    tab.image_px = (clip.width, clip.height);
+                    tab.full = clip.full;
+                    tab.summary = Some(clip.summary);
+                    tab.failure = None;
+                    tab.note = None;
+                }
+                Outcome::Frame(frame) => {
+                    let Some(clip) = &mut tab.clip else { continue };
+                    let image = ColorImage::from_rgb([clip.width, clip.height], &frame.rgb);
+                    let name = format!("frame-{}-{}", tab.id, frame.at);
+                    clip.put(frame.at, ctx.load_texture(name, image, TextureOptions::LINEAR));
+                    // The first frame of a loop stands in for it in the strip.
+                    if frame.at == 0 {
+                        let version = tab.asked.as_ref().map_or(0, |a| a.0);
+                        let thumb = ColorImage::from_rgb([clip.width, clip.height], &frame.rgb);
+                        let name = format!("thumb-{}-{:x}", tab.id, tab.seed);
+                        let thumb = ctx.load_texture(name, thumb, TextureOptions::LINEAR);
+                        if let Some(shot) = tab.history.get_mut(tab.at) {
+                            shot.thumb = Some((thumb, version));
+                        }
+                    }
+                }
+                Outcome::Nothing(summary, what) => {
                     tab.summary = Some(summary);
                     tab.image = None;
+                    tab.clip = None;
                     tab.failure = None;
+                    tab.note = Some(what);
+                    tab.follow();
                 }
-                // The last good image stays on screen, dimmed, while the code is broken.
+                // The last good picture stays on screen, dimmed, while the
+                // code is broken.
                 Outcome::Failed(f) => tab.failure = Some(f),
             }
         }
         while let Ok(done) = self.exports.1.try_recv() {
             self.exporting = false;
             match done {
-                Ok(path) => self.say(format!("Exported {}", path.display()), false),
+                Ok(said) => self.say(said, false),
                 Err(e) => self.say(format!("Export failed: {e}"), true),
             }
         }
@@ -256,16 +291,29 @@ impl App {
         }
     }
 
+    /// Moves the loop along, and keeps the window repainting while it plays.
+    fn play(&mut self, ctx: &Context) {
+        let tab = &mut self.tabs[self.active];
+        let Some(clip) = &tab.clip else { return };
+        if !tab.playing || clip.ready == 0 {
+            return;
+        }
+        let step = Duration::from_secs_f64(1.0 / clip.fps.max(1.0));
+        let dt = ctx.input(|i| i.stable_dt).min(0.2) as f64;
+        tab.position = (tab.position + dt / clip.duration.max(0.01)).rem_euclid(1.0);
+        ctx.request_repaint_after(step);
+    }
+
     /// Asks for a new preview when the text, the seed or the viewport changed.
     fn request(&mut self, ctx: &Context) {
         let tab = &self.tabs[self.active];
         let doc = &self.docs[tab.doc];
-        let want = (doc.version, tab.seed, self.side);
-        if tab.asked == Some(want) {
+        let want = (doc.version, tab.seed, self.side, tab.shown.clone());
+        if tab.asked.as_ref() == Some(&want) {
             return;
         }
         // Only typing waits: a reroll should feel instant.
-        let typing = tab.asked.is_some_and(|a| a.0 != doc.version);
+        let typing = tab.asked.as_ref().is_some_and(|a| a.0 != doc.version);
         let rested = doc.changed_at.elapsed();
         if typing && rested < DEBOUNCE {
             ctx.request_repaint_after(DEBOUNCE - rested);
@@ -408,15 +456,20 @@ impl App {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let label = if self.exporting { "Exporting…" } else { "Export PNG" };
+                    // What the button writes is whatever the viewport shows.
+                    let shown = self.tabs[self.active].shown.clone();
+                    let label = match (self.exporting, shown.as_str()) {
+                        (true, _) => "Exporting…",
+                        (false, "video") => "Export GIF",
+                        _ => "Export PNG",
+                    };
                     let export = egui::Button::new(RichText::new(label).strong().color(theme::INK)).fill(theme::PAPER);
-                    let has_image =
-                        self.tabs[self.active].summary.as_ref().is_some_and(|s| s.renders.iter().any(|r| r == "image"));
-                    if ui
-                        .add_enabled(has_image && !self.exporting, export)
-                        .on_hover_text("The edition on screen, at the size the work asks for")
-                        .clicked()
-                    {
+                    let can = self.tabs[self.active].summary.as_ref().is_some_and(|s| s.renders.contains(&shown));
+                    let hint = match shown.as_str() {
+                        "video" => "The loop on screen, written as a GIF (an MP4 with its sound comes from the command line)",
+                        _ => "The edition on screen, at the size the work asks for",
+                    };
+                    if ui.add_enabled(can && !self.exporting, export).on_hover_text(hint).clicked() {
                         self.export();
                     }
                     if ui.button("Save").clicked() {
@@ -947,58 +1000,115 @@ impl App {
     }
 
     fn viewport(&mut self, ctx: &Context) {
+        let mut show = None;
         let tab = &self.tabs[self.active];
+        let (shown, playing) = (tab.shown.clone(), tab.playing);
+        let mut play = None;
+        let mut seek = None;
+
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WELL)).show(ctx, |ui| {
+            let tab = &self.tabs[self.active];
             header(ui, "RENDERS", |ui| {
-                if tab.image.is_some() {
-                    let zoom = 100.0 * tab.image_px.0 as f32 / tab.full.0.max(1) as f32;
-                    ui.label(
-                        RichText::new(format!("{} × {} · preview at {zoom:.0} %", tab.full.0, tab.full.1))
-                            .small()
-                            .monospace()
-                            .color(theme::MUTED),
-                    );
+                match (&tab.clip, &tab.image) {
+                    (Some(clip), _) => {
+                        let text = format!("{} × {} · {:.0} fps · {:.1} s", tab.full.0, tab.full.1, clip.fps, clip.duration);
+                        ui.label(RichText::new(text).small().monospace().color(theme::MUTED));
+                    }
+                    (None, Some(_)) => {
+                        let zoom = 100.0 * tab.image_px.0 as f32 / tab.full.0.max(1) as f32;
+                        let text = format!("{} × {} · preview at {zoom:.0} %", tab.full.0, tab.full.1);
+                        ui.label(RichText::new(text).small().monospace().color(theme::MUTED));
+                    }
+                    _ => {}
                 }
                 if let Some(s) = &tab.summary {
                     for kind in s.renders.iter().rev() {
-                        let shown = kind == "image";
-                        let (ink, fill) = if shown { (theme::INK, theme::PAPER) } else { (theme::MUTED, theme::WELL) };
-                        egui::Frame::new()
-                            .fill(fill)
-                            .stroke(Stroke::new(1.0_f32, theme::EDGE))
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(9, 1))
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(kind).small().strong().color(ink));
-                            });
+                        let here = *kind == shown;
+                        let text = RichText::new(kind).small().strong().color(if here { theme::INK } else { theme::TEXT });
+                        let chip = egui::Button::new(text)
+                            .fill(if here { theme::PAPER } else { theme::WELL })
+                            .stroke(Stroke::new(1.0_f32, if here { theme::PAPER } else { theme::EDGE }))
+                            .corner_radius(10);
+                        if ui.add(chip).on_hover_text(format!("Show `render {kind}`")).clicked() {
+                            show = Some(kind.clone());
+                        }
                     }
                 }
             });
+
+            // A loop plays under its own transport.
+            if tab.clip.is_some() && shown == "video" {
+                let frame = egui::Frame::new().fill(theme::INK).inner_margin(egui::Margin::symmetric(14, 8));
+                egui::TopBottomPanel::bottom("transport").frame(frame).show_inside(ui, |ui| {
+                    let tab = &self.tabs[self.active];
+                    let clip = tab.clip.as_ref().expect("a clip");
+                    ui.horizontal(|ui| {
+                        let mark = if playing { "Hold" } else { "Play" };
+                        let button = egui::Button::new(RichText::new(mark).strong().color(theme::INK))
+                            .fill(theme::PAPER)
+                            .min_size(Vec2::new(54.0, 28.0));
+                        if ui.add(button).on_hover_text("Play or hold the loop").clicked() {
+                            play = Some(!playing);
+                        }
+                        let mut position = tab.position;
+                        ui.spacing_mut().slider_width = (ui.available_width() - 150.0).max(80.0);
+                        ui.visuals_mut().selection.bg_fill = theme::VERMILION;
+                        ui.visuals_mut().widgets.inactive.bg_fill = theme::LINE;
+                        let scrub = egui::Slider::new(&mut position, 0.0..=1.0).show_value(false);
+                        if ui.add(scrub).changed() {
+                            seek = Some(position);
+                        }
+                        let text = match clip.done() {
+                            true => format!("{:.1} / {:.1} s", position * clip.duration, clip.duration),
+                            false => format!("drawing {}/{}", clip.ready, clip.frames.len()),
+                        };
+                        let ink = if clip.done() { theme::MUTED } else { theme::AMBER };
+                        ui.label(RichText::new(text).small().monospace().color(ink));
+                    });
+                });
+            }
 
             let area = ui.available_rect_before_wrap().shrink(28.0);
             // What the viewport can show decides the size of the preview.
             let px = (area.width().min(area.height()) * ctx.pixels_per_point()).max(64.0) as usize;
             self.side = px.div_ceil(128) * 128;
 
-            match (&tab.image, &tab.summary) {
-                (Some(image), _) => {
-                    let rect = fit(image.size_vec2(), area);
-                    let tint = if tab.failure.is_some() { Color32::from_gray(110) } else { Color32::WHITE };
+            let tab = &self.tabs[self.active];
+            let dim = tab.failure.is_some();
+            let shot = match (shown.as_str(), &tab.clip, &tab.image) {
+                ("video", Some(clip), _) => clip.at(tab.position).map(|frame| (frame, clip.width, clip.height)),
+                (_, _, Some(image)) => Some((image, tab.image_px.0, tab.image_px.1)),
+                _ => None,
+            };
+            match (shot, &tab.note) {
+                (Some((texture, w, h)), _) => {
+                    let rect = fit(Vec2::new(w as f32, h as f32), area);
+                    let tint = if dim { Color32::from_gray(110) } else { Color32::WHITE };
                     ui.painter().rect_filled(rect.expand(1.0), 0, theme::LINE);
-                    ui.painter().image(image.id(), rect, UV, tint);
+                    ui.painter().image(texture.id(), rect, UV, tint);
                 }
-                (None, Some(s)) if tab.failure.is_none() => {
-                    let what = s.renders.join(", ");
-                    let text = format!("{} renders {what}.\nThe viewport shows `render image` for now.", s.name);
-                    ui.painter().text(area.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.0), theme::MUTED);
+                (None, Some(note)) if !dim => {
+                    ui.painter().text(area.center(), Align2::CENTER_CENTER, note, FontId::proportional(14.0), theme::MUTED);
                 }
                 _ => {
-                    let text =
-                        if tab.failure.is_some() { "Nothing to show until the work reads correctly." } else { "Drawing…" };
+                    let text = if dim { "Nothing to show until the work reads correctly." } else { "Drawing…" };
                     ui.painter().text(area.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.0), theme::MUTED);
                 }
             }
         });
+
+        let tab = &mut self.tabs[self.active];
+        if let Some(kind) = show {
+            tab.shown = kind;
+            tab.position = 0.0;
+        }
+        if let Some(on) = play {
+            tab.playing = on;
+        }
+        if let Some(position) = seek {
+            tab.position = position;
+            tab.playing = false;
+        }
     }
 }
 
@@ -1012,6 +1122,7 @@ impl eframe::App for App {
         self.controls_pane(ctx);
         self.viewport(ctx);
         self.offer_list(ctx);
+        self.play(ctx);
         self.request(ctx);
 
         let tab = &self.tabs[self.active];
