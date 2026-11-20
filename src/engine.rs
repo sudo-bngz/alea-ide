@@ -49,6 +49,9 @@ pub enum Outcome {
     Frame(Frame),
     /// What the work plays, as lanes of notes.
     Music(Summary, crate::score::Music),
+    /// The same music as samples, which takes a moment longer to render
+    /// than the lanes do and so comes after them.
+    Sound(crate::sound::Take),
     /// The work is fine, but this is not something the viewport can show.
     Nothing(Summary, String),
     Failed(Failure),
@@ -182,6 +185,14 @@ fn failure(e: Error, job: &Job) -> Failure {
     Failure { text: e.display(&job.source, &job.file), line: e.span.filter(|_| !elsewhere).map(|s| s.line) }
 }
 
+/// Renders what the work plays, the same way an export writes a WAV: what
+/// comes out of the speakers is what comes out of the file.
+fn hear(ed: &Edition) -> Res<crate::sound::Take> {
+    let render = ed.renders.iter().find(|r| r.kind == "sound").ok_or_else(|| Error::bare("this work renders no sound"))?;
+    let channels = media::sound_channels(render, ed.seed)?;
+    Ok(crate::sound::Take::from_channels(&channels, media::SAMPLE_RATE))
+}
+
 /// Runs `f`, turning a panic inside the engine into an ordinary failure: a
 /// work that trips a bug must not take the editor down with it.
 fn guarded<T>(job: &Job, f: impl FnOnce() -> Res<T>) -> Result<T, Failure> {
@@ -269,13 +280,26 @@ fn worker(inbox: Receiver<Job>, outbox: Sender<Reply>, wake: impl Fn()) {
             continue;
         }
         if job.shown == "sound" || job.shown == "midi" {
+            // The lanes first: they are quick, and they are what the roll
+            // is drawn from. The samples take a moment longer and follow.
+            let heard = ed.renders.iter().any(|r| r.kind == "sound");
             match guarded(&job, || Ok(media::live_score(&ed).transpose()?.map(|score| crate::score::read(&score)))) {
-                Ok(Some(music)) if !music.is_empty() => send(true, Outcome::Music(summary, music)),
+                Ok(Some(music)) if !music.is_empty() => send(!heard, Outcome::Music(summary, music)),
                 Ok(_) => {
                     let what = "This work's sound is made of fields rather than notes, so there is nothing to lay out.";
                     send(true, Outcome::Nothing(summary, what.into()));
+                    continue;
                 }
-                Err(f) => send(true, Outcome::Failed(f)),
+                Err(f) => {
+                    send(true, Outcome::Failed(f));
+                    continue;
+                }
+            }
+            if heard {
+                match guarded(&job, || hear(&ed)) {
+                    Ok(take) => send(true, Outcome::Sound(take)),
+                    Err(f) => send(true, Outcome::Failed(f)),
+                }
             }
             continue;
         }

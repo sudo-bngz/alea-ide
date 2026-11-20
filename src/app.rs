@@ -18,6 +18,7 @@ use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, OnCan
 use crate::engine::{Engine, Job, Outcome, Preview};
 use crate::export::{self, Format, Options, Progress};
 use crate::reference::{self, Entry};
+use crate::sound::Speaker;
 use crate::theme;
 
 /// How long the text must rest before a preview is drawn.
@@ -71,6 +72,10 @@ pub struct App {
     knobs: Vec<Knob>,
     knobs_of: Option<(usize, u64)>,
     reference: Option<Reference>,
+    /// The sound output, and whose music is loaded in it: a tab, as of one
+    /// of its editions.
+    speaker: Speaker,
+    sounding: Option<(u64, u64)>,
 }
 
 /// The completion list, as it stands between two frames.
@@ -134,6 +139,8 @@ impl App {
             knobs: Vec::new(),
             knobs_of: None,
             reference: None,
+            speaker: Speaker::new(),
+            sounding: None,
         };
         match file {
             Some(path) => app.open(path),
@@ -561,6 +568,11 @@ impl App {
                     tab.failure = None;
                     tab.note = None;
                 }
+                Outcome::Sound(take) => {
+                    tab.take = Some(take);
+                    tab.heard += 1;
+                    tab.failure = None;
+                }
                 Outcome::Nothing(summary, what) => {
                     tab.summary = Some(summary);
                     tab.image = None;
@@ -584,6 +596,34 @@ impl App {
         }
         if self.notice.as_ref().is_some_and(|n| n.2.elapsed() > Duration::from_secs(8)) {
             self.notice = None;
+        }
+    }
+
+    /// Keeps the speaker on the music in front of the eyes: the active
+    /// tab's, as of its latest edition. A new edition of the same work
+    /// slips in without stopping, which is what makes a knob or a step
+    /// worth moving while it plays.
+    fn listen(&mut self, ctx: &Context) {
+        let tab = &self.tabs[self.active];
+        let listening = matches!(tab.shown.as_str(), "sound" | "midi");
+        let want = tab.take.as_ref().map(|_| (tab.id, tab.heard));
+        if self.sounding.map(|(id, _)| id) != want.map(|(id, _)| id) {
+            // Another work: it starts at its own beginning.
+            self.speaker.rewind();
+        }
+        if self.sounding != want {
+            match &self.tabs[self.active].take {
+                Some(take) => self.speaker.load(take.clone()),
+                None => self.speaker.forget(),
+            }
+            self.sounding = want;
+        }
+        if !listening && self.speaker.playing() {
+            self.speaker.hold();
+        }
+        if self.speaker.playing() {
+            // The playhead moves between edits, so the roll is redrawn.
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -1409,6 +1449,7 @@ impl App {
         let (shown, playing) = (tab.shown.clone(), tab.playing);
         let mut play = None;
         let mut seek = None;
+        let (mut hear, mut rewind, mut scrub_to) = (None, false, None);
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::WELL)).show(ctx, |ui| {
             let tab = &self.tabs[self.active];
@@ -1444,6 +1485,59 @@ impl App {
                     }
                 }
             });
+
+            // What a work plays, it plays under its own transport.
+            if matches!(shown.as_str(), "sound" | "midi") && tab.music.is_some() {
+                let frame = egui::Frame::new().fill(theme::INK).inner_margin(egui::Margin::symmetric(14, 8));
+                egui::TopBottomPanel::bottom("playing").frame(frame).show_inside(ui, |ui| {
+                    let tab = &self.tabs[self.active];
+                    // The samples say exactly how long it is; until they are
+                    // here, the score's own length will do.
+                    let duration = match &tab.take {
+                        Some(take) => take.duration,
+                        None => tab.music.as_ref().map_or(0.0, |m| m.duration),
+                    };
+                    let ready = tab.take.is_some();
+                    let sounds = tab.summary.as_ref().is_some_and(|s| s.renders.iter().any(|k| k == "sound"));
+                    ui.horizontal(|ui| {
+                        let on = self.speaker.playing();
+                        let mark = if on { "Hold" } else { "Play" };
+                        let button = egui::Button::new(RichText::new(mark).strong().color(theme::INK))
+                            .fill(if ready { theme::PAPER } else { theme::LINE })
+                            .min_size(Vec2::new(54.0, 28.0));
+                        let hint = match (sounds, ready) {
+                            (false, _) => "This work writes MIDI but renders no sound of its own",
+                            (_, false) => "The sound is still being rendered",
+                            _ => "Play the loop",
+                        };
+                        if ui.add_enabled(ready, button).on_disabled_hover_text(hint).on_hover_text(hint).clicked() {
+                            hear = Some(!on);
+                        }
+                        let back = egui::Button::new(RichText::new("⏮").color(theme::TEXT)).fill(theme::BAR);
+                        if ui.add_enabled(ready, back).on_hover_text("Back to the top").clicked() {
+                            rewind = true;
+                        }
+                        let mut position = if duration > 0.0 { self.speaker.at() / duration } else { 0.0 };
+                        ui.spacing_mut().slider_width = (ui.available_width() - 150.0).max(80.0);
+                        ui.visuals_mut().selection.bg_fill = theme::VERMILION;
+                        ui.visuals_mut().widgets.inactive.bg_fill = theme::LINE;
+                        let scrub = egui::Slider::new(&mut position, 0.0..=1.0).show_value(false);
+                        if ui.add_enabled(ready, scrub).changed() {
+                            scrub_to = Some(position * duration);
+                        }
+                        let (text, ink, why) = match (self.speaker.trouble(), sounds, ready) {
+                            (Some(why), ..) => ("no sound here".to_string(), theme::VERMILION, Some(why)),
+                            (None, false, _) => ("MIDI only".into(), theme::MUTED, None),
+                            (None, _, false) => ("rendering the sound…".into(), theme::AMBER, None),
+                            _ => (format!("{:.1} / {duration:.1} s", position * duration), theme::MUTED, None),
+                        };
+                        let said = ui.label(RichText::new(text).small().monospace().color(ink));
+                        if let Some(why) = why {
+                            said.on_hover_text(why);
+                        }
+                    });
+                });
+            }
 
             // A loop plays under its own transport.
             if tab.clip.is_some() && shown == "video" {
@@ -1484,7 +1578,10 @@ impl App {
 
             let tab = &self.tabs[self.active];
             if let (true, Some(music)) = (matches!(shown.as_str(), "sound" | "midi"), &tab.music) {
-                roll(ui, music, area);
+                let playhead = tab.take.as_ref().map(|_| self.speaker.at());
+                if let Some(seconds) = roll(ui, music, area, playhead) {
+                    scrub_to = Some(seconds);
+                }
                 return;
             }
             let dim = tab.failure.is_some();
@@ -1514,6 +1611,18 @@ impl App {
                 }
             }
         });
+
+        match hear {
+            Some(true) => self.speaker.play(),
+            Some(false) => self.speaker.hold(),
+            None => {}
+        }
+        if rewind {
+            self.speaker.rewind();
+        }
+        if let Some(seconds) = scrub_to {
+            self.speaker.seek(seconds);
+        }
 
         let tab = &mut self.tabs[self.active];
         if let Some(kind) = show {
@@ -1546,6 +1655,7 @@ impl eframe::App for App {
         self.offer_list(ctx);
         self.export_dialog(ctx);
         self.play(ctx);
+        self.listen(ctx);
         self.request(ctx);
 
         let tab = &self.tabs[self.active];
@@ -1746,14 +1856,22 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, draggi
 
 /// The music of a work laid out in time: a lane per layer, notes where
 /// they fall, and a knob's turns as a line.
-fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect) {
+fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect, playhead: Option<f64>) -> Option<f64> {
     use crate::score::Lane;
     const NAMES: f32 = 96.0;
     // A lane for each layer, and a strip at the top for the bar numbers.
     let bars = Rect::from_min_size(area.min, Vec2::new(area.width(), 18.0));
     let body = Rect::from_min_max(egui::pos2(area.left(), bars.bottom()), area.max);
     let roll = Rect::from_min_max(egui::pos2(body.left() + NAMES, body.top()), body.max);
-    let painter = ui.painter();
+    let painter = ui.painter().clone();
+
+    // The bar numbers are also where the music is scrubbed from.
+    let mut seek = None;
+    let ruler = ui.interact(bars, ui.id().with("ruler"), Sense::click_and_drag());
+    if let Some(p) = ruler.interact_pointer_pos() {
+        let across = ((p.x - roll.left()) / roll.width().max(1.0)).clamp(0.0, 1.0);
+        seek = Some(across as f64 * music.duration);
+    }
 
     let beats = music.beats().max(1.0);
     let per_beat = roll.width() / beats as f32;
@@ -1822,6 +1940,15 @@ fn roll(ui: &mut egui::Ui, music: &crate::score::Music, area: Rect) {
             }
         }
     }
+
+    // Where it is up to, if it is playing.
+    if let Some(t) = playhead {
+        let x = at(t.clamp(0.0, music.duration));
+        painter.vline(x, egui::Rangef::new(bars.top(), body.bottom()), Stroke::new(1.0_f32, theme::VERMILION));
+        let head = [egui::pos2(x - 4.0, bars.top()), egui::pos2(x + 4.0, bars.top()), egui::pos2(x, bars.top() + 6.0)];
+        painter.add(egui::Shape::convex_polygon(head.to_vec(), theme::VERMILION, Stroke::NONE));
+    }
+    seek
 }
 
 /// A number of the work, shown on the canvas where it means something.

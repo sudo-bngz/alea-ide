@@ -13,6 +13,7 @@ mod engine;
 mod export;
 mod reference;
 mod score;
+mod sound;
 mod theme;
 
 use std::path::PathBuf;
