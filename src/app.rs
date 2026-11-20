@@ -13,7 +13,7 @@ use egui::{
 };
 
 use crate::complete::{self, Candidate};
-use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, STARTER};
+use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, EXAMPLES, STARTER};
 use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, Opt};
 use crate::engine::{self, Engine, Job, Outcome, Preview};
 use crate::reference::{self, Entry};
@@ -447,6 +447,20 @@ impl App {
                 }
                 if ui.button("+").on_hover_text("This work in a new tab, at another seed").clicked() {
                     self.push_tab(self.tabs[self.active].doc);
+                }
+                let mut open = None;
+                ui.menu_button("Examples", |ui| {
+                    for (name, _) in EXAMPLES {
+                        if ui.button(*name).clicked() {
+                            open = Some(*name);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Works that come with the IDE");
+                if let Some(name) = open.and_then(Doc::example) {
+                    self.add_tab(name);
                 }
                 if let Some(k) = select {
                     self.active = k;

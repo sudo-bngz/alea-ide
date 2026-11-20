@@ -100,6 +100,10 @@ cargo run --release                  # opens a starter work
 cargo run --release -- rosace.alea   # or a file
 ```
 
+Two works come with the IDE, under **Examples** in the top bar: `rosace`,
+the still one the window opens on, and `breathing`, which renders a video as
+well as an image — the one to open to see a loop play.
+
 ## Keys
 
 | Key | Action |

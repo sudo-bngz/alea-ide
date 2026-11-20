@@ -480,6 +480,18 @@ mod tests {
     }
 
     #[test]
+    fn every_work_that_comes_with_the_ide_draws() {
+        for (name, text) in crate::doc::EXAMPLES {
+            let job = Job { file: format!("{name}.alea"), ..job(text, 7) };
+            let ed = edition(&job).unwrap_or_else(|e| panic!("{name}: {}", e.msg));
+            assert!(!ed.renders.is_empty(), "{name} renders nothing");
+            // Whatever it renders, the viewport can show one of them.
+            let kinds: Vec<&str> = ed.renders.iter().map(|r| r.kind.as_str()).collect();
+            assert!(kinds.iter().any(|k| matches!(*k, "image" | "video")), "{name} renders only {kinds:?}");
+        }
+    }
+
+    #[test]
     fn a_seed_names_an_edition() {
         let pixels = |seed| {
             let ed = edition(&job(ROSACE, seed)).map_err(|e| e.msg).unwrap();

@@ -12,9 +12,15 @@ use crate::engine::{Failure, Summary};
 
 pub const STARTER: &str = include_str!("../assets/starter.alea");
 
+/// Works that come with the IDE, to open and pull apart. The first one is
+/// what a new window starts on.
+pub const EXAMPLES: &[(&str, &str)] = &[("rosace", STARTER), ("breathing", include_str!("../assets/breathing.alea"))];
+
 pub struct Doc {
     pub path: Option<PathBuf>,
     pub text: String,
+    /// What to call a work that has no file yet.
+    unsaved_name: String,
     /// Bumped on every edit; previews and thumbnails remember which one they show.
     pub version: u64,
     saved: u64,
@@ -23,7 +29,16 @@ pub struct Doc {
 
 impl Doc {
     pub fn new(path: Option<PathBuf>, text: String) -> Self {
-        Doc { path, text, version: 0, saved: 0, changed_at: Instant::now() }
+        Doc { path, text, unsaved_name: "untitled.alea".into(), version: 0, saved: 0, changed_at: Instant::now() }
+    }
+
+    /// One of the works that come with the IDE, under its own name so the
+    /// errors and the command line it shows read like the real thing.
+    pub fn example(name: &str) -> Option<Self> {
+        let (name, text) = EXAMPLES.iter().find(|(n, _)| *n == name)?;
+        let mut doc = Doc::new(None, (*text).to_string());
+        doc.unsaved_name = format!("{name}.alea");
+        Some(doc)
     }
 
     pub fn open(path: &Path) -> std::io::Result<Self> {
@@ -35,7 +50,7 @@ impl Doc {
         self.path
             .as_deref()
             .and_then(Path::file_name)
-            .map_or_else(|| "untitled.alea".into(), |n| n.to_string_lossy().into_owned())
+            .map_or_else(|| self.unsaved_name.clone(), |n| n.to_string_lossy().into_owned())
     }
 
     /// The folder `use` paths are relative to, and where exports go by default.
@@ -242,6 +257,17 @@ pub fn parse_seed(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_works_that_come_with_the_ide_are_named_after_themselves() {
+        let breathing = Doc::example("breathing").expect("breathing");
+        assert_eq!(breathing.file_name(), "breathing.alea");
+        assert!(breathing.text.contains("render video"), "it is the one that moves");
+        assert_eq!(Doc::example("rosace").map(|d| d.file_name()).as_deref(), Some("rosace.alea"));
+        assert!(Doc::example("nothing").is_none());
+        // A saved file keeps its own name.
+        assert_eq!(Doc::new(None, String::new()).file_name(), "untitled.alea");
+    }
 
     #[test]
     fn seeds_round_trip() {
