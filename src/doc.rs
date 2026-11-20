@@ -72,14 +72,16 @@ pub struct Clip {
     pub width: usize,
     pub height: usize,
     pub fps: f64,
+    /// The rate the work asks for, which an export starts from.
+    pub asked_fps: f64,
     pub duration: f64,
     pub frames: Vec<Option<TextureHandle>>,
     pub ready: usize,
 }
 
 impl Clip {
-    pub fn new(width: usize, height: usize, fps: f64, duration: f64, frames: usize) -> Self {
-        Clip { width, height, fps, duration, frames: (0..frames).map(|_| None).collect(), ready: 0 }
+    pub fn new(width: usize, height: usize, fps: f64, asked_fps: f64, duration: f64, frames: usize) -> Self {
+        Clip { width, height, fps, asked_fps, duration, frames: (0..frames).map(|_| None).collect(), ready: 0 }
     }
 
     pub fn put(&mut self, at: usize, frame: TextureHandle) {

@@ -62,6 +62,8 @@ pub struct Clip {
     /// Frames per second of the preview, which may be gentler than the
     /// work's own.
     pub fps: f64,
+    /// The rate the work asks for, which an export starts from.
+    pub asked_fps: f64,
     pub frames: usize,
     pub duration: f64,
 }
@@ -93,7 +95,6 @@ pub struct Preview {
 
 #[derive(Clone, Debug)]
 pub struct Failure {
-    pub message: String,
     /// 1-based line in the tab's own text; `None` when the error is in a
     /// file it `use`s, or has no position.
     pub line: Option<usize>,
@@ -176,7 +177,7 @@ fn clip_plan(spec: &media::VideoSpec, max_side: usize) -> (usize, usize, f64, us
 
 fn failure(e: Error, job: &Job) -> Failure {
     let elsewhere = e.origin.as_ref().is_some_and(|(file, _)| *file != job.file);
-    Failure { text: e.display(&job.source, &job.file), line: e.span.filter(|_| !elsewhere).map(|s| s.line), message: e.msg }
+    Failure { text: e.display(&job.source, &job.file), line: e.span.filter(|_| !elsewhere).map(|s| s.line) }
 }
 
 /// Runs `f`, turning a panic inside the engine into an ordinary failure: a
@@ -186,7 +187,6 @@ fn guarded<T>(job: &Job, f: impl FnOnce() -> Res<T>) -> Result<T, Failure> {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(failure(e, job)),
         Err(_) => Err(Failure {
-            message: "alea stopped unexpectedly while drawing this work".into(),
             line: None,
             text: "alea stopped unexpectedly while drawing this work (this is a bug in the engine, not in your work)".into(),
         }),
@@ -339,7 +339,16 @@ fn clip(
             return Ok(None);
         }
     };
-    let clip = Clip { summary: summary.clone(), width, height, full: (spec.w, spec.h), fps, frames, duration: spec.duration };
+    let clip = Clip {
+        summary: summary.clone(),
+        width,
+        height,
+        full: (spec.w, spec.h),
+        fps,
+        asked_fps: spec.fps as f64,
+        frames,
+        duration: spec.duration,
+    };
     send(false, Outcome::Clip(clip));
 
     for k in 0..frames {
@@ -365,86 +374,6 @@ fn clip(
         }
     }
     Ok(None)
-}
-
-/// Writes the edition's image at its full size as `<work>-<seed>.png` in
-/// `dir`, named like the command line names it.
-pub fn export_png(job: &Job, dir: &Path) -> Result<PathBuf, String> {
-    let preview = guarded(job, || {
-        let ed = edition(job)?;
-        paint(&ed, None)
-    })
-    .map_err(|f| f.message)?
-    .ok_or("this work has no `render image` to export")?;
-    let path = dir.join(format!("{}-{:016x}.png", slug(job), job.seed));
-    let img = image::RgbImage::from_raw(preview.width as u32, preview.height as u32, preview.rgb)
-        .ok_or("the image buffer has the wrong size")?;
-    img.save(&path).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(path)
-}
-
-/// The most a GIF is asked to carry: past this it is a video file, which is
-/// what the command line writes with ffmpeg.
-const GIF_SIDE: usize = 480;
-const GIF_FPS: f64 = 15.0;
-const GIF_FRAMES: usize = 120;
-
-/// Writes the edition's loop as a GIF, which needs nothing installed. A
-/// long or large loop is capped: the line it reports says what was written.
-pub fn export_gif(job: &Job, dir: &Path) -> Result<(PathBuf, String), String> {
-    let path = dir.join(format!("{}-{:016x}.gif", slug(job), job.seed));
-    let said = guarded(job, || {
-        let ed = edition(job)?;
-        let render = render_of(&ed, "video").ok_or_else(|| Error::bare("this work has no `render video` to export"))?;
-        let spec = media::video_spec(render)?;
-        let visual = render.visual("the field to animate")?;
-
-        let scale = (GIF_SIDE as f64 / spec.w.max(spec.h) as f64).min(1.0);
-        let width = ((spec.w as f64 * scale).round() as usize).max(16);
-        let height = ((spec.h as f64 * scale).round() as usize).max(16);
-        let fps = (spec.fps as f64).min(GIF_FPS);
-        let frames = ((spec.duration * fps).round() as usize).clamp(1, GIF_FRAMES);
-        let fps = frames as f64 / spec.duration;
-        let still = match &visual {
-            Visual::Field(f) => Some((
-                f.cached_for_frames(width, height, ed.seed, 48),
-                spec.range.unwrap_or_else(|| media::animation_bounds(f, width, height, ed.seed)),
-            )),
-            Visual::Paint(_) => None,
-        };
-
-        let file = std::fs::File::create(&path).map_err(|e| Error::bare(format!("writing {}: {e}", path.display())))?;
-        let mut gif = image::codecs::gif::GifEncoder::new_with_speed(std::io::BufWriter::new(file), 10);
-        gif.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| Error::bare(e.to_string()))?;
-        // GIF delays are whole hundredths of a second, so the frame rate is
-        // rounded to one the format can keep.
-        let hundredths = (100.0 / fps).round().max(2.0) as u32;
-        for k in 0..frames {
-            let t = k as f64 / frames as f64;
-            let rgb = match &still {
-                Some((field, bounds)) => media::frame_rgb(field, width, height, t, ed.seed, &spec.stops, Some(*bounds)),
-                None => visual.rgb(width, height, t, ed.seed, &spec.stops, None),
-            };
-            let mut rgba = Vec::with_capacity(width * height * 4);
-            for px in rgb.chunks(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-            let buffer = image::RgbaImage::from_raw(width as u32, height as u32, rgba)
-                .ok_or_else(|| Error::bare("the frame buffer has the wrong size"))?;
-            let delay = image::Delay::from_numer_denom_ms(hundredths * 10, 1);
-            gif.encode_frame(image::Frame::from_parts(buffer, 0, 0, delay))
-                .map_err(|e| Error::bare(format!("writing {}: {e}", path.display())))?;
-        }
-        drop(gif);
-        Ok(format!("{width} × {height}, {frames} frames at {:.0} fps", 100.0 / hundredths as f64))
-    })
-    .map_err(|f| f.message)?;
-    Ok((path, said))
-}
-
-/// What the files of this work are called, as the command line names them.
-fn slug(job: &Job) -> String {
-    Path::new(&job.file).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "work".into())
 }
 
 #[cfg(test)]
@@ -494,7 +423,7 @@ mod tests {
         let j = job("work Broken {\n  let a = blob(x: 0.5\n  render image(a)\n}\n", 1);
         let f = guarded(&j, || edition(&j)).unwrap_err();
         assert!(f.line.is_some(), "no line in: {}", f.text);
-        assert!(!f.message.is_empty());
+        assert!(f.text.contains("error"), "{}", f.text);
     }
 
     #[test]
@@ -547,19 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn a_loop_is_exported_as_a_gif_that_plays() {
-        let dir = std::env::temp_dir().join(format!("alea-ide-gif-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (path, said) = export_gif(&Job { shown: "video".into(), ..job(BREATHING, 3) }, &dir).unwrap();
-        assert_eq!(path.file_name().unwrap(), "rosace-0000000000000003.gif");
-        assert!(said.contains("120 × 120"), "{said}");
-        let (w, h) = image::image_dimensions(&path).unwrap();
-        assert_eq!((w, h), (120, 120));
-        assert!(std::fs::metadata(&path).unwrap().len() > 1000, "a gif of thirty frames is not tiny");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn a_work_without_a_loop_says_so_rather_than_failing() {
         let engine = Engine::new(|| {});
         engine.draw(Job { shown: "video".into(), ..job(ROSACE, 5) });
@@ -568,19 +484,6 @@ mod tests {
             Outcome::Nothing(_, what) => assert!(what.contains("render video"), "{what}"),
             _ => panic!("expected a plain answer"),
         }
-    }
-
-    #[test]
-    fn export_writes_the_full_size_under_the_seed_name() {
-        let dir = std::env::temp_dir().join(format!("alea-ide-export-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = export_png(&job(ROSACE, 5), &dir).unwrap();
-        assert_eq!(path.file_name().unwrap(), "rosace-0000000000000005.png");
-        let (w, h) = image::image_dimensions(&path).unwrap();
-        let ed = edition(&job(ROSACE, 5)).map_err(|e| e.msg).unwrap();
-        let full = paint(&ed, Some(16)).map_err(|e| e.msg).unwrap().unwrap().full;
-        assert_eq!((w as usize, h as usize), full);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -15,7 +15,8 @@ use egui::{
 use crate::complete::{self, Candidate};
 use crate::doc::{format_seed, parse_seed, random_seed, Clip, Doc, Tab, STARTER};
 use crate::draws::{self, add_option, remove_option, Edit, Kind, Knob, Num, Opt};
-use crate::engine::{self, Engine, Job, Outcome, Preview};
+use crate::engine::{Engine, Job, Outcome, Preview};
+use crate::export::{self, Format, Options, Progress};
 use crate::reference::{self, Entry};
 use crate::theme;
 
@@ -26,6 +27,17 @@ const THUMB: usize = 144;
 
 type Exported = Result<String, String>;
 
+/// The export dialog: what it is set to, and how far a run has got.
+struct Exporting {
+    options: Options,
+    /// Which editions: this one, or the ones kept in this tab.
+    kept: bool,
+    running: bool,
+    /// What the run is doing, and how far along it is.
+    progress: (Sender<Progress>, Receiver<Progress>),
+    said: Option<(String, usize, usize, f32)>,
+}
+
 pub struct App {
     docs: Vec<Doc>,
     tabs: Vec<Tab>,
@@ -34,7 +46,10 @@ pub struct App {
     next_id: u64,
     serial: u64,
     exports: (Sender<Exported>, Receiver<Exported>),
-    exporting: bool,
+    /// The export dialog, while it is open.
+    export: Option<Exporting>,
+    /// Where the last export went, offered again for the next one.
+    folder: Option<PathBuf>,
     /// A line of news in the top bar, and whether it is bad news.
     notice: Option<(String, bool, Instant)>,
     /// Longest side the viewport can show, in pixels (rounded up, so small
@@ -98,7 +113,8 @@ impl App {
             next_id: 1,
             serial: 0,
             exports: mpsc::channel(),
-            exporting: false,
+            export: None,
+            folder: None,
             notice: None,
             side: 512,
             offer: None,
@@ -194,25 +210,279 @@ impl App {
         }
     }
 
+    /// Opens the export dialog, set to what the work asks for.
     fn export(&mut self) {
-        if self.exporting {
+        if self.export.is_some() {
             return;
         }
         let tab = &self.tabs[self.active];
-        let (loop_, kind) = (tab.shown == "video", tab.shown.clone());
-        let title = if loop_ { "Export this loop as a GIF to…" } else { "Export this edition to…" };
-        let Some(dir) = rfd::FileDialog::new().set_title(title).set_directory(self.docs[tab.doc].dir()).pick_folder() else {
+        let folder = self.folder.clone().unwrap_or_else(|| self.docs[tab.doc].dir());
+        if Format::of(&tab.shown).is_empty() {
+            self.say(format!("`{}` cannot be written yet", tab.shown), true);
             return;
+        }
+        // What the work asks for: the size of the still or of the loop, and
+        // the loop's own rate.
+        let (width, height) = tab.full;
+        let fps = tab.clip.as_ref().map_or(30.0, |c| c.asked_fps);
+        let Some(options) = Options::new(&tab.shown, (width, height), fps, folder) else { return };
+        self.export = Some(Exporting { options, kept: false, running: false, progress: mpsc::channel(), said: None });
+    }
+
+    /// Starts the run the dialog is set to.
+    fn export_now(&mut self) {
+        let Some(export) = &mut self.export else { return };
+        if export.running {
+            return;
+        }
+        let seeds = {
+            let tab = &self.tabs[self.active];
+            match export.kept {
+                true => tab.history.iter().filter(|s| s.kept).map(|s| s.seed).collect(),
+                false => vec![tab.seed],
+            }
         };
-        let (job, done) = (self.job(tab, 0), self.exports.0.clone());
-        self.exporting = true;
+        if seeds.is_empty() {
+            return;
+        }
+        export.running = true;
+        self.folder = Some(export.options.folder.clone());
+        let options = export.options.clone();
+        let tell = export.progress.0.clone();
+        let done = self.exports.0.clone();
+        let job = self.job(&self.tabs[self.active], 0);
         std::thread::spawn(move || {
-            let said = match kind.as_str() {
-                "video" => engine::export_gif(&job, &dir).map(|(path, how)| format!("Exported {} — {how}", path.display())),
-                _ => engine::export_png(&job, &dir).map(|path| format!("Exported {}", path.display())),
-            };
+            let said = export::run(&job, &options, &seeds, &|p| {
+                let _ = tell.send(p);
+            })
+            .map(|files| match files.as_slice() {
+                [one] => format!("Exported {}", one.display()),
+                many => format!("Exported {} editions to {}", many.len(), options.folder.display()),
+            });
             let _ = done.send(said);
         });
+    }
+
+    /// The dialog itself.
+    fn export_dialog(&mut self, ctx: &Context) {
+        let Some(mut export) = self.export.take() else { return };
+        while let Ok(p) = export.progress.1.try_recv() {
+            export.said = Some((p.what, p.edition, p.editions, p.done));
+        }
+        let tab = &self.tabs[self.active];
+        let renders = tab.summary.as_ref().map(|s| s.renders.clone()).unwrap_or_default();
+        let kept = tab.history.iter().filter(|s| s.kept).count();
+        let slug = export::slug(&self.job(tab, 0));
+        let duration = tab.clip.as_ref().map_or(0.0, |c| c.duration);
+        let asked = tab.full;
+
+        let (mut close, mut start) = (false, false);
+        let frame = egui::Frame::new()
+            .fill(theme::PANEL)
+            .stroke(Stroke::new(1.0_f32, theme::EDGE))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(20, 16));
+        let answer = egui::Modal::new(Id::new("export")).frame(frame).show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.label(RichText::new("Export").size(16.0).strong().color(theme::PAPER));
+            ui.add_space(10.0);
+
+            if renders.len() > 1 {
+                ui.label(caption("WHAT"));
+                ui.horizontal_wrapped(|ui| {
+                    for kind in &renders {
+                        let here = *kind == export.options.kind;
+                        let text = RichText::new(kind).monospace().size(12.0).color(if here { theme::INK } else { theme::TEXT });
+                        let button = egui::Button::new(text)
+                            .fill(if here { theme::PAPER } else { theme::BAR })
+                            .stroke(Stroke::new(1.0_f32, if here { theme::PAPER } else { theme::EDGE }));
+                        let can = !Format::of(kind).is_empty();
+                        if ui.add_enabled(can && !export.running, button).clicked() {
+                            export.options.kind = kind.clone();
+                            export.options.format = Format::of(kind)[0];
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            let formats = Format::of(&export.options.kind);
+            if formats.len() > 1 {
+                ui.label(caption("FORMAT"));
+                ui.horizontal_wrapped(|ui| {
+                    for format in formats {
+                        let here = *format == export.options.format;
+                        let ready = !format.needs_ffmpeg() || export::has_ffmpeg();
+                        let text = RichText::new(format.name()).size(12.0).color(if here { theme::INK } else { theme::TEXT });
+                        let button = egui::Button::new(text)
+                            .fill(if here { theme::PAPER } else { theme::BAR })
+                            .stroke(Stroke::new(1.0_f32, if here { theme::PAPER } else { theme::EDGE }));
+                        let hint = match ready {
+                            true => format!("Write a {}", format.name()),
+                            false => "An MP4 needs ffmpeg, which is not on this machine".to_string(),
+                        };
+                        if ui.add_enabled(ready && !export.running, button).on_hover_text(hint).clicked() {
+                            export.options.format = *format;
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if export.options.format.sized() {
+                ui.label(caption("SIZE"));
+                ui.horizontal(|ui| {
+                    let ratio = export.options.ratio();
+                    let mut width = export.options.width as f64;
+                    let mut height = export.options.height as f64;
+                    fn field(value: &mut f64) -> egui::DragValue<'_> {
+                        egui::DragValue::new(value).speed(4.0).range(16.0..=8192.0).fixed_decimals(0)
+                    }
+                    if ui.add_enabled(!export.running, field(&mut width)).changed() {
+                        export.options.width = width as usize;
+                        if export.options.keep_ratio {
+                            export.options.height = ((width * ratio).round() as usize).max(16);
+                        }
+                    }
+                    ui.label(RichText::new("×").color(theme::MUTED));
+                    if ui.add_enabled(!export.running, field(&mut height)).changed() {
+                        export.options.height = height as usize;
+                        if export.options.keep_ratio {
+                            export.options.width = ((height / ratio.max(0.01)).round() as usize).max(16);
+                        }
+                    }
+                    ui.add_enabled(!export.running, egui::Checkbox::new(&mut export.options.keep_ratio, "keep proportions"));
+                    let as_written = egui::Button::new(RichText::new("as written").small()).frame(false);
+                    if ui.add_enabled(!export.running, as_written).on_hover_text(format!("{} × {}", asked.0, asked.1)).clicked()
+                    {
+                        (export.options.width, export.options.height) = asked;
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if export.options.format == Format::Jpeg {
+                ui.label(caption("QUALITY"));
+                let mut quality = export.options.quality as f64;
+                ui.spacing_mut().slider_width = 240.0;
+                if ui.add_enabled(!export.running, egui::Slider::new(&mut quality, 40.0..=100.0).fixed_decimals(0)).changed() {
+                    export.options.quality = quality as u8;
+                }
+                ui.add_space(10.0);
+            }
+
+            if export.options.format.moving() {
+                ui.label(caption("FRAMES A SECOND"));
+                ui.horizontal(|ui| {
+                    let mut fps = export.options.fps;
+                    if ui
+                        .add_enabled(
+                            !export.running,
+                            egui::DragValue::new(&mut fps).speed(0.5).range(1.0..=60.0).fixed_decimals(0),
+                        )
+                        .changed()
+                    {
+                        export.options.fps = fps;
+                    }
+                    let frames = export.options.frames(duration);
+                    ui.label(RichText::new(format!("{frames} frames · {duration:.1} s")).small().color(theme::MUTED));
+                });
+                ui.add_space(10.0);
+            }
+
+            ui.label(caption("EDITIONS"));
+            ui.horizontal(|ui| {
+                let this = egui::RadioButton::new(!export.kept, "this one");
+                if ui.add_enabled(!export.running, this).clicked() {
+                    export.kept = false;
+                }
+                let label = match kept {
+                    0 => "none kept yet".to_string(),
+                    1 => "the one kept".to_string(),
+                    n => format!("the {n} kept"),
+                };
+                let all = egui::RadioButton::new(export.kept, label);
+                if ui
+                    .add_enabled(kept > 0 && !export.running, all)
+                    .on_hover_text("Every edition marked Keep in this tab, one file each")
+                    .clicked()
+                {
+                    export.kept = true;
+                }
+            });
+            ui.add_space(10.0);
+
+            ui.label(caption("FOLDER"));
+            ui.horizontal(|ui| {
+                let mut shown = export.options.folder.display().to_string();
+                let field = egui::TextEdit::singleline(&mut shown).desired_width(300.0).font(FontId::monospace(12.0));
+                if ui.add_enabled(!export.running, field).changed() {
+                    export.options.folder = PathBuf::from(shown);
+                }
+                if ui.add_enabled(!export.running, egui::Button::new("Choose…")).clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().set_directory(&export.options.folder).pick_folder() {
+                        export.options.folder = folder;
+                    }
+                }
+            });
+            ui.add_space(12.0);
+
+            // What will be written, in the words of the files themselves.
+            let seeds = match export.kept {
+                true => kept,
+                false => 1,
+            };
+            let first = export.options.file_name(&slug, self.tabs[self.active].seed);
+            let line = match seeds {
+                1 => first,
+                n => format!("{first} and {} more", n - 1),
+            };
+            ui.add(egui::Label::new(RichText::new(line).monospace().small().color(theme::MUTED)).truncate());
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                match (&export.said, export.running) {
+                    (Some((what, k, of, done)), true) => {
+                        let text = match of {
+                            1 => format!("{what}…"),
+                            of => format!("edition {k} of {of} · {what}…"),
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(*done)
+                                .desired_width(240.0)
+                                .fill(theme::VERMILION)
+                                .text(RichText::new(text).small()),
+                        );
+                    }
+                    (None, true) => {
+                        ui.add(
+                            egui::ProgressBar::new(0.0)
+                                .desired_width(240.0)
+                                .fill(theme::VERMILION)
+                                .text(RichText::new("drawing…").small()),
+                        );
+                    }
+                    _ => {}
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let write = egui::Button::new(RichText::new("Export").strong().color(theme::INK)).fill(theme::PAPER);
+                    if ui.add_enabled(!export.running, write).clicked() {
+                        start = true;
+                    }
+                    if ui.add_enabled(!export.running, egui::Button::new("Cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+
+        if answer.should_close() && !export.running {
+            close = true;
+        }
+        self.export = (!close).then_some(export);
+        if start {
+            self.export_now();
+        }
     }
 
     /// Takes what the engine and the export thread have finished.
@@ -243,7 +513,7 @@ impl App {
                     tab.follow();
                 }
                 Outcome::Clip(clip) => {
-                    tab.clip = Some(Clip::new(clip.width, clip.height, clip.fps, clip.duration, clip.frames));
+                    tab.clip = Some(Clip::new(clip.width, clip.height, clip.fps, clip.asked_fps, clip.duration, clip.frames));
                     tab.image_px = (clip.width, clip.height);
                     tab.full = clip.full;
                     tab.summary = Some(clip.summary);
@@ -280,7 +550,7 @@ impl App {
             }
         }
         while let Ok(done) = self.exports.1.try_recv() {
-            self.exporting = false;
+            self.export = None;
             match done {
                 Ok(said) => self.say(said, false),
                 Err(e) => self.say(format!("Export failed: {e}"), true),
@@ -456,20 +726,11 @@ impl App {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // What the button writes is whatever the viewport shows.
+                    let export = egui::Button::new(RichText::new("Export…").strong().color(theme::INK)).fill(theme::PAPER);
                     let shown = self.tabs[self.active].shown.clone();
-                    let label = match (self.exporting, shown.as_str()) {
-                        (true, _) => "Exporting…",
-                        (false, "video") => "Export GIF",
-                        _ => "Export PNG",
-                    };
-                    let export = egui::Button::new(RichText::new(label).strong().color(theme::INK)).fill(theme::PAPER);
                     let can = self.tabs[self.active].summary.as_ref().is_some_and(|s| s.renders.contains(&shown));
-                    let hint = match shown.as_str() {
-                        "video" => "The loop on screen, written as a GIF (an MP4 with its sound comes from the command line)",
-                        _ => "The edition on screen, at the size the work asks for",
-                    };
-                    if ui.add_enabled(can && !self.exporting, export).on_hover_text(hint).clicked() {
+                    let hint = "What this work renders, in the format and size you choose";
+                    if ui.add_enabled(can && self.export.is_none(), export).on_hover_text(hint).clicked() {
                         self.export();
                     }
                     if ui.button("Save").clicked() {
@@ -1122,6 +1383,7 @@ impl eframe::App for App {
         self.controls_pane(ctx);
         self.viewport(ctx);
         self.offer_list(ctx);
+        self.export_dialog(ctx);
         self.play(ctx);
         self.request(ctx);
 
