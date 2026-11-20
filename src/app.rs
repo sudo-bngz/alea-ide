@@ -96,6 +96,13 @@ struct Reference {
     shown: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    Undo,
+    Redo,
+    Revert,
+}
+
 enum Key2 {
     None,
     Move(isize),
@@ -621,6 +628,12 @@ impl App {
         if cmd(Key::E) {
             self.export();
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)) {
+            self.step(Step::Redo);
+        }
+        if cmd(Key::Z) {
+            self.step(Step::Undo);
+        }
         if cmd(Key::T) {
             self.push_tab(self.tabs[self.active].doc);
         }
@@ -649,6 +662,72 @@ impl App {
             .filter(|word| word.starts_with(|c: char| c.is_alphabetic() || c == '_'));
         let shown = word.as_deref().and_then(reference::find).map(|e| e.name.clone());
         self.reference = Some(Reference { query: shown.clone().or(word).unwrap_or_default(), shown });
+    }
+
+    /// Takes the work back a step, forward again, or all the way to where
+    /// it began. What a control wrote is undone like anything else: it is
+    /// all the same text.
+    fn step(&mut self, step: Step) {
+        let doc = &mut self.docs[self.tabs[self.active].doc];
+        let moved = match step {
+            Step::Undo => doc.undo(),
+            Step::Redo => doc.redo(),
+            Step::Revert => doc.revert(),
+        };
+        if !moved {
+            return;
+        }
+        // The controls pointed into the text as it was.
+        self.selected = None;
+        self.editing = None;
+        self.editing_choice = None;
+        if step == Step::Revert {
+            self.say("Back to the work as it was opened", false);
+        }
+    }
+
+    /// The handles the selected control puts on the canvas. A work says
+    /// where its shapes are in canvas units, so `x`, `y` and `size` can be
+    /// pulled about on the picture itself; everything else stays a slider.
+    fn handles(&self) -> Vec<Handle> {
+        let tab = &self.tabs[self.active];
+        if !matches!(tab.shown.as_str(), "image" | "video") {
+            return Vec::new();
+        }
+        let Some(selected) = self.selected else { return Vec::new() };
+        let Some(call) = self.knobs.iter().find(|k| k.at == selected).and_then(|k| k.call.clone()) else {
+            return Vec::new();
+        };
+        // The numbers of that one call, by the name they were given.
+        let number = |arg: &str| {
+            self.knobs.iter().find(|k| k.arg == arg && k.call.as_ref().is_some_and(|c| c.at == call.at)).and_then(|k| {
+                match &k.kind {
+                    Kind::Number(num) => Some((k.at, num.clone())),
+                    _ => None,
+                }
+            })
+        };
+        let (Some((x_at, x)), Some((y_at, y))) = (number("x"), number("y")) else {
+            return Vec::new();
+        };
+        let middle = (x.value, y.value);
+        let mut out = vec![Handle {
+            knob: x_at,
+            at: middle,
+            label: format!("{} {} · {}", call.name, x.text(x.value), y.text(y.value)),
+            here: selected == x_at || selected == y_at,
+            moves: Moves::Point { x, y },
+        }];
+        if let Some((size_at, size)) = number("size") {
+            out.push(Handle {
+                knob: size_at,
+                at: (middle.0, middle.1 - size.value / 2.0),
+                label: format!("size {}", size.text(size.value)),
+                here: selected == size_at,
+                moves: Moves::Size { size, middle },
+            });
+        }
+        out
     }
 
     /// The knobs of the work on screen, read again when its text changes.
@@ -1156,13 +1235,36 @@ impl App {
 
         let frame = egui::Frame::new().fill(theme::PANEL);
         egui::SidePanel::right("controls").frame(frame).default_width(344.0).width_range(260.0..=560.0).show(ctx, |ui| {
+            let doc = &self.docs[doc_index];
+            let (can_undo, can_redo, changed) = (doc.can_undo(), doc.can_redo(), doc.changed());
+            let mut step = None;
             header(ui, "CONTROLS", |ui| {
+                let revert = egui::Button::new(RichText::new("Revert").small()).frame(false);
+                if ui.add_enabled(changed, revert).on_hover_text("Back to the work as it was opened, or last saved").clicked() {
+                    step = Some(Step::Revert);
+                }
+                let redo = egui::Button::new(RichText::new("Redo").small()).frame(false);
+                if ui.add_enabled(can_redo, redo).on_hover_text("Forward again (Cmd/Ctrl+Shift+Z)").clicked() {
+                    step = Some(Step::Redo);
+                }
+                let undo = egui::Button::new(RichText::new("Undo").small()).frame(false);
+                if ui
+                    .add_enabled(can_undo, undo)
+                    .on_hover_text("Back a step, whether it was typed or pulled (Cmd/Ctrl+Z)")
+                    .clicked()
+                {
+                    step = Some(Step::Undo);
+                }
                 let text = match knobs.len() {
                     0 => "nothing to tune".to_string(),
-                    n => format!("{draws} draws · {} numbers", n - draws),
+                    n => format!("{draws} · {}", n - draws),
                 };
-                ui.label(RichText::new(text).small().color(theme::MUTED));
+                ui.label(RichText::new(text).small().color(theme::FAINT))
+                    .on_hover_text(format!("{draws} draws, {} numbers", knobs.len() - draws));
             });
+            if let Some(step) = step {
+                self.step(step);
+            }
             self.facts_panel(ui);
 
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -1280,6 +1382,8 @@ impl App {
     }
 
     fn viewport(&mut self, ctx: &Context) {
+        let handles = self.handles();
+        let (mut edits, mut pick) = (Vec::new(), None);
         let mut show = None;
         let tab = &self.tabs[self.active];
         let (shown, playing) = (tab.shown.clone(), tab.playing);
@@ -1366,6 +1470,11 @@ impl App {
                     let tint = if dim { Color32::from_gray(110) } else { Color32::WHITE };
                     ui.painter().rect_filled(rect.expand(1.0), 0, theme::LINE);
                     ui.painter().image(texture.id(), rect, UV, tint);
+                    for handle in &handles {
+                        if let Some(edit) = pull(ui, handle, rect, &mut pick) {
+                            edits.extend(edit);
+                        }
+                    }
                 }
                 (None, Some(note)) if !dim => {
                     ui.painter().text(area.center(), Align2::CENTER_CENTER, note, FontId::proportional(14.0), theme::MUTED);
@@ -1389,6 +1498,10 @@ impl App {
             tab.position = position;
             tab.playing = false;
         }
+        if let Some(knob) = pick {
+            self.selected = Some(knob);
+        }
+        self.rewrite(edits);
     }
 }
 
@@ -1546,6 +1659,26 @@ fn slider(ui: &mut egui::Ui, id: (usize, usize), num: &Num, accent: bool, draggi
     (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) })
 }
 
+/// A number of the work, shown on the canvas where it means something.
+struct Handle {
+    /// The knob it writes to, so the canvas and the pane agree on what is
+    /// selected.
+    knob: usize,
+    /// Where it sits, in canvas units: 0 to 1 from the top left.
+    at: (f64, f64),
+    moves: Moves,
+    label: String,
+    here: bool,
+}
+
+/// What dragging a handle writes.
+enum Moves {
+    /// Where a shape is.
+    Point { x: Num, y: Num },
+    /// How wide it is, taken from its middle.
+    Size { size: Num, middle: (f64, f64) },
+}
+
 /// Which slider is being dragged, and the span it had when the drag began.
 type Dragging = Option<((usize, usize), std::ops::RangeInclusive<f64>)>;
 
@@ -1588,6 +1721,63 @@ fn segmented(ui: &mut egui::Ui, id: usize, options: &[Opt], held: Option<usize>,
         }
     });
     clicked
+}
+
+/// Draws one handle on the picture and lets it be pulled. The picture is
+/// the work's canvas, so a position in canvas units lands at the same place
+/// whatever size the preview is; a drag reads the pointer straight off it,
+/// which is why it cannot run away as a slider once could.
+fn pull(ui: &mut egui::Ui, handle: &Handle, canvas: Rect, pick: &mut Option<usize>) -> Option<Vec<Edit>> {
+    let on_screen = |at: (f64, f64)| canvas.min + Vec2::new(at.0 as f32 * canvas.width(), at.1 as f32 * canvas.height());
+    let ink = if handle.here { theme::AMBER } else { theme::BLUSH };
+    let middle = on_screen(handle.at);
+
+    // What the number means, drawn faintly: the width of the shape, or the
+    // line from its middle out to the handle.
+    if let Moves::Size { size, middle: shape } = &handle.moves {
+        let centre = on_screen(*shape);
+        let radius = (size.value / 2.0) as f32 * canvas.width();
+        let ring: Vec<Pos2> = (0..=64)
+            .map(|k| {
+                let turn = k as f32 / 64.0 * std::f32::consts::TAU;
+                centre + Vec2::new(turn.cos() * radius, turn.sin() * radius)
+            })
+            .collect();
+        let dashes = egui::Shape::dashed_line(&ring, Stroke::new(1.0_f32, ink.gamma_multiply(0.7)), 4.0, 4.0);
+        ui.painter().extend(dashes);
+        ui.painter().line_segment([centre, middle], Stroke::new(1.0_f32, ink.gamma_multiply(0.7)));
+    }
+
+    let box_at = Rect::from_center_size(middle, Vec2::splat(11.0));
+    let shown = ui.interact(box_at.expand(9.0), Id::new(("handle", handle.knob)), Sense::click_and_drag());
+    ui.painter().rect_filled(box_at, 2, ink);
+    ui.painter().rect_stroke(box_at, 2, Stroke::new(1.0_f32, theme::INK), egui::StrokeKind::Inside);
+
+    if handle.here || shown.hovered() || shown.dragged() {
+        let text = egui::WidgetText::from(RichText::new(&handle.label).monospace().size(11.0).color(theme::INK));
+        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Small);
+        let chip = Rect::from_center_size(middle - Vec2::new(0.0, 22.0), galley.size() + Vec2::new(12.0, 6.0));
+        ui.painter().rect_filled(chip, 3, ink);
+        ui.painter().galley(chip.center() - galley.size() / 2.0, galley, theme::INK);
+    }
+
+    if shown.clicked() || shown.dragged() {
+        *pick = Some(handle.knob);
+    }
+    let pointer = shown.dragged().then(|| shown.interact_pointer_pos()).flatten()?;
+    let at = (((pointer.x - canvas.left()) / canvas.width()) as f64, ((pointer.y - canvas.top()) / canvas.height()) as f64);
+    match &handle.moves {
+        Moves::Point { x, y } => Some(vec![
+            Edit { at: x.at.clone(), text: x.text_fine(at.0.clamp(-1.0, 2.0)) },
+            Edit { at: y.at.clone(), text: y.text_fine(at.1.clamp(-1.0, 2.0)) },
+        ]),
+        // The handle sits half a width above the middle, so the width is
+        // twice the distance it has been pulled.
+        Moves::Size { size, middle } => {
+            let wide = ((middle.1 - at.1) * 2.0).clamp(0.001, 4.0);
+            Some(vec![Edit { at: size.at.clone(), text: size.text_fine(wide) }])
+        }
+    }
 }
 
 /// One row of the controls: a choice, a range, or a number.

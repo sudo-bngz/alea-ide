@@ -90,10 +90,21 @@ Clicking the name of a control shows you the piece of code it owns.
   `0.015` keeps its three decimals.
 - A **range** — `~between(0.5, 0.8)` — has a slider per end, which widens or
   narrows what the next edition may draw.
+- A **handle on the picture.** Click the name of an `x`, a `y` or a `size`
+  and the shape it belongs to gets handles on the canvas: one to move it,
+  one to make it wider, with a dashed ring showing how wide it is now. The
+  picture is the work's own canvas, so a handle lands where you put it.
 - A **choice** — `choose { 5 | 6 | 8 }` — is a row of its options. Click one
   to **hold** the choice there: every edition draws that option until you
   click it again. The `…` button writes the options out instead, to change
   their text, take one out, or add one more.
+
+![A shape with its handles on the canvas](docs/handle.png)
+
+**Undo** takes back the last step, whether it was typed, pulled or clicked —
+it is all the same text — and **Revert** goes back to the work as it was
+opened, or as it was last saved. A pull across the canvas is one step, not
+fifty: changes stop joining a step after a pause, or after four seconds.
 
 Holding is written in the work, in the language's own weights:
 `choose { 0: 5 | 1: 6 | 0: 8 }`. Nothing is hidden in the editor, the held
@@ -139,7 +150,9 @@ well as an image — the one to open to see a loop play.
 | `Ctrl/Cmd+T` | This work in a new tab, at another seed |
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl/Cmd+O` / `S` | Open / save |
-| `Ctrl/Cmd+E` | Export PNG |
+| `Ctrl/Cmd+Z` | Undo |
+| `Ctrl/Cmd+Shift+Z` | Redo |
+| `Ctrl/Cmd+E` | Export |
 | `Ctrl/Cmd+Space` | Offer names here |
 | `F1` / `Ctrl/Cmd+K` | The reference |
 

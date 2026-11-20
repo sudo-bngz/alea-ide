@@ -16,9 +16,26 @@ pub const STARTER: &str = include_str!("../assets/starter.alea");
 /// what a new window starts on.
 pub const EXAMPLES: &[(&str, &str)] = &[("rosace", STARTER), ("breathing", include_str!("../assets/breathing.alea"))];
 
+/// A pause this long ends a step, so a word typed letter by letter, or a
+/// handle pulled across the canvas, comes back in one go.
+const QUIET: Duration = Duration::from_millis(400);
+/// However steadily the changes come, a step never swallows more than this.
+const LONGEST: Duration = Duration::from_secs(4);
+/// How far back a work can be taken.
+const STEPS: usize = 200;
+
 pub struct Doc {
     pub path: Option<PathBuf>,
     pub text: String,
+    /// The work as it was opened, or as it was last saved: where Revert
+    /// goes back to.
+    opened: String,
+    /// What was, and what was undone.
+    past: Vec<String>,
+    future: Vec<String>,
+    /// The text as of the last edit, which is the text before the next one.
+    before: String,
+    pushed_at: Instant,
     /// What to call a work that has no file yet.
     unsaved_name: String,
     /// Bumped on every edit; previews and thumbnails remember which one they show.
@@ -29,7 +46,19 @@ pub struct Doc {
 
 impl Doc {
     pub fn new(path: Option<PathBuf>, text: String) -> Self {
-        Doc { path, text, unsaved_name: "untitled.alea".into(), version: 0, saved: 0, changed_at: Instant::now() }
+        Doc {
+            opened: text.clone(),
+            before: text.clone(),
+            text,
+            path,
+            unsaved_name: "untitled.alea".into(),
+            version: 0,
+            saved: 0,
+            changed_at: Instant::now(),
+            past: Vec::new(),
+            future: Vec::new(),
+            pushed_at: Instant::now() - LONGEST,
+        }
     }
 
     /// One of the works that come with the IDE, under its own name so the
@@ -62,9 +91,72 @@ impl Doc {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
+    /// Called after the text has changed, by the editor or by a control.
     pub fn edited(&mut self) {
+        let since = self.changed_at.elapsed();
         self.version += 1;
         self.changed_at = Instant::now();
+        // A step ends at a pause, or when it has gone on long enough; a
+        // drag writes a number every frame and is one step, not fifty.
+        let quiet = since >= QUIET || self.pushed_at.elapsed() >= LONGEST;
+        if quiet && self.before != self.text {
+            self.past.push(std::mem::take(&mut self.before));
+            if self.past.len() > STEPS {
+                self.past.remove(0);
+            }
+            self.pushed_at = Instant::now();
+        }
+        self.future.clear();
+        self.before = self.text.clone();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.past.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.future.is_empty()
+    }
+
+    /// Whether Revert would change anything.
+    pub fn changed(&self) -> bool {
+        self.text != self.opened
+    }
+
+    /// Back one step. Everything a control writes goes through the same
+    /// text, so undoing takes back a slider's pull as readily as a word.
+    pub fn undo(&mut self) -> bool {
+        let Some(text) = self.past.pop() else { return false };
+        self.future.push(std::mem::replace(&mut self.text, text));
+        self.stepped();
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(text) = self.future.pop() else { return false };
+        self.past.push(std::mem::replace(&mut self.text, text));
+        self.stepped();
+        true
+    }
+
+    /// Back to the work as it was opened, or as it was last saved. The step
+    /// itself can be undone.
+    pub fn revert(&mut self) -> bool {
+        if !self.changed() {
+            return false;
+        }
+        self.past.push(std::mem::replace(&mut self.text, self.opened.clone()));
+        self.future.clear();
+        self.stepped();
+        true
+    }
+
+    fn stepped(&mut self) {
+        self.version += 1;
+        self.changed_at = Instant::now();
+        self.before = self.text.clone();
+        // A step of its own: the next edit does not join it.
+        self.changed_at = Instant::now() - QUIET;
     }
 
     pub fn dirty(&self) -> bool {
@@ -77,6 +169,8 @@ impl Doc {
         };
         std::fs::write(path, &self.text)?;
         self.saved = self.version;
+        // Saved is the new beginning: Revert comes back here.
+        self.opened = self.text.clone();
         Ok(())
     }
 }
@@ -269,6 +363,91 @@ mod tests {
         assert!(Doc::example("nothing").is_none());
         // A saved file keeps its own name.
         assert_eq!(Doc::new(None, String::new()).file_name(), "untitled.alea");
+    }
+
+    #[test]
+    fn a_work_can_be_taken_back_a_step_at_a_time() {
+        let mut doc = Doc::new(None, "one".into());
+        assert!(!doc.can_undo() && !doc.changed());
+
+        doc.text = "two".into();
+        doc.edited();
+        // Two changes within a moment of each other are one step.
+        doc.text = "three".into();
+        doc.edited();
+        assert!(doc.can_undo() && doc.changed());
+
+        assert!(doc.undo());
+        assert_eq!(doc.text, "one", "the burst came back in one step");
+        assert!(!doc.can_undo() && doc.can_redo());
+        assert!(doc.redo());
+        assert_eq!(doc.text, "three");
+        assert!(!doc.redo(), "nothing further to come back to");
+    }
+
+    #[test]
+    fn a_long_steady_run_of_changes_is_still_one_step() {
+        // What a drag looks like: a change every few milliseconds, with no
+        // pause anywhere in it.
+        let mut doc = Doc::new(None, "0.22".into());
+        for k in 1..40 {
+            doc.text = format!("0.{k}");
+            doc.edited();
+        }
+        assert!(doc.undo());
+        assert_eq!(doc.text, "0.22", "the whole pull came back at once");
+    }
+
+    #[test]
+    fn steps_far_enough_apart_are_their_own() {
+        let mut doc = Doc::new(None, "one".into());
+        for text in ["two", "three"] {
+            doc.text = text.into();
+            doc.changed_at = Instant::now() - QUIET;
+            doc.edited();
+        }
+        doc.undo();
+        assert_eq!(doc.text, "two");
+        doc.undo();
+        assert_eq!(doc.text, "one");
+    }
+
+    #[test]
+    fn revert_goes_back_to_the_beginning_and_can_itself_be_undone() {
+        let mut doc = Doc::new(None, "one".into());
+        for text in ["two", "three", "four"] {
+            doc.text = text.into();
+            doc.changed_at = Instant::now() - QUIET;
+            doc.edited();
+        }
+        assert!(doc.revert());
+        assert_eq!(doc.text, "one");
+        assert!(!doc.changed() && !doc.revert(), "already at the beginning");
+        assert!(doc.undo());
+        assert_eq!(doc.text, "four", "the revert itself came back");
+    }
+
+    #[test]
+    fn a_new_change_forgets_what_was_undone() {
+        let mut doc = Doc::new(None, "one".into());
+        doc.text = "two".into();
+        doc.edited();
+        doc.undo();
+        assert!(doc.can_redo());
+        doc.text = "other".into();
+        doc.edited();
+        assert!(!doc.can_redo(), "the work went another way");
+    }
+
+    #[test]
+    fn the_past_does_not_grow_without_end() {
+        let mut doc = Doc::new(None, String::new());
+        for k in 0..STEPS + 50 {
+            doc.text = format!("{k}");
+            doc.changed_at = Instant::now() - QUIET;
+            doc.edited();
+        }
+        assert_eq!(doc.past.len(), STEPS);
     }
 
     #[test]
