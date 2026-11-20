@@ -38,17 +38,23 @@ once.
 The code stays the truth. A control holds no value of its own: it reads one
 out of the text and writes one back, so moving a slider and typing the
 number yourself are the same edit, and the preview redraws either way.
+Clicking the name of a control shows you the piece of code it owns.
 
-- A **number** is dragged. It keeps the shape it was written in: `80` moves
-  in whole millimetres, `0.015` in thousandths.
-- A **range** — `~between(0.5, 0.8)` — has its two ends dragged, which
-  widens or narrows what the next edition may draw.
-- A **choice** — `choose { 5 | 6 | 8 }` — has one box per option. Type in a
-  box to change that option (the work is rewritten once you leave it, never
-  mid-word), `×` takes one out, `+` adds one more.
+- A **number** is a slider, with its value beside it to type into. The slider
+  runs from 0 to 1 for a ratio and to twice its value otherwise; typing goes
+  further. A number keeps the shape it was written in: `80` stays whole,
+  `0.015` keeps its three decimals.
+- A **range** — `~between(0.5, 0.8)` — has a slider per end, which widens or
+  narrows what the next edition may draw.
+- A **choice** — `choose { 5 | 6 | 8 }` — is a row of its options. Click one
+  to **hold** the choice there: every edition draws that option until you
+  click it again. The `…` button writes the options out instead, to change
+  their text, take one out, or add one more.
 
-Holding a draw at one value while the rest reroll (pinning) needs the engine
-to say which value each draw got, which it does not yet.
+Holding is written in the work, in the language's own weights:
+`choose { 0: 5 | 1: 6 | 0: 8 }`. Nothing is hidden in the editor, the held
+option survives a save and a reopen, and letting go puts the line back as it
+was. A choice the artist has weighted themselves is left alone.
 
 ## While you write
 
