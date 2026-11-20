@@ -245,6 +245,10 @@ pub struct Tab {
     pub clip: Option<Clip>,
     /// What the work plays, when the viewport is showing its music.
     pub music: Option<crate::score::Music>,
+    /// The same music as samples, once they are rendered.
+    pub take: Option<crate::sound::Take>,
+    /// Bumped whenever a new take arrives, so the speaker knows to pick it up.
+    pub heard: u64,
     pub playing: bool,
     /// Where in the loop, from 0 to 1.
     pub position: f64,
@@ -277,6 +281,8 @@ impl Tab {
             shown: "image".into(),
             clip: None,
             music: None,
+            take: None,
+            heard: 0,
             playing: true,
             position: 0.0,
             note: None,
