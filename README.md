@@ -90,10 +90,14 @@ Clicking the name of a control shows you the piece of code it owns.
   `0.015` keeps its three decimals.
 - A **range** — `~between(0.5, 0.8)` — has a slider per end, which widens or
   narrows what the next edition may draw.
-- A **handle on the picture.** Click the name of an `x`, a `y` or a `size`
-  and the shape it belongs to gets handles on the canvas: one to move it,
-  one to make it wider, with a dashed ring showing how wide it is now. The
+- A **handle on the picture.** Touch the control of an `x`, a `y` or a
+  `size` and the shape it belongs to gets handles on the canvas: one to move
+  it, one to make it wider, with a dashed ring around what it covers. The
   picture is the work's own canvas, so a handle lands where you put it.
+  A shape that goes through `kaleidoscope`, `warp`, `mirror`, `move` or any
+  other transform on its way to the picture is no longer drawn where its own
+  numbers say, so it gets no handle and the control says which transform
+  moved it.
 - A **choice** — `choose { 5 | 6 | 8 }` — is a row of its options. Click one
   to **hold** the choice there: every edition draws that option until you
   click it again. The `…` button writes the options out instead, to change

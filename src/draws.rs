@@ -5,6 +5,7 @@
 //! reads one out of the text and writes one back, so moving a slider and
 //! typing the number yourself are the same edit.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use alea::ast::{Arg, Expr, ExprKind, GrowRule, Stmt, Work};
@@ -97,6 +98,20 @@ pub enum Kind {
     Number(Num),
 }
 
+/// Whether a call's `x` and `y` are where the picture shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OnCanvas {
+    /// What the call draws reaches the picture where it was put, so a
+    /// handle on the picture means something.
+    Yes,
+    /// Something bends the canvas on the way: the name of the first one.
+    /// The shape is still drawn, but not where its own numbers say.
+    Folded(String),
+    /// Nothing the work renders reaches this call, or the work does not
+    /// render a picture at all.
+    No,
+}
+
 /// The call a number was written inside: `blob(x: 0.72, …)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call {
@@ -121,6 +136,8 @@ pub struct Knob {
     pub at: usize,
     /// The call it was written inside, when it was.
     pub call: Option<Call>,
+    /// Whether that call draws where its numbers say.
+    pub on_canvas: OnCanvas,
     pub kind: Kind,
 }
 
@@ -236,7 +253,107 @@ pub fn knobs(src: &str) -> Vec<Knob> {
     walk.out.sort_by_key(|k| k.at);
     walk.out.truncate(LIMIT);
     number_the_repeats(&mut walk.out);
+
+    // Which calls draw where they say, so the picture only grows handles
+    // that mean something.
+    let drawn = drawn_where_it_says(src, &program.work);
+    for knob in &mut walk.out {
+        if let Some(call) = &knob.call {
+            knob.on_canvas = drawn.get(&call.at).cloned().unwrap_or(OnCanvas::No);
+        }
+    }
     walk.out
+}
+
+/// `kaleidoscope`, `warp`, `mirror` and the rest of the transforms move
+/// what they are given about the canvas, so a shape inside one is no longer
+/// drawn where its own `x` and `y` say. Anything the IDE does not know —
+/// a work's own function, say — is treated the same way.
+fn folds(name: &str) -> bool {
+    crate::reference::find(name).is_none_or(|entry| entry.section == "Transforms")
+}
+
+/// Follows each render back through the work to the calls it draws, noting
+/// what bends the canvas on the way.
+fn drawn_where_it_says(src: &str, work: &Work) -> HashMap<usize, OnCanvas> {
+    let mut named: HashMap<&str, &Expr> = HashMap::new();
+    let mut renders: Vec<&Expr> = Vec::new();
+    for stmt in &work.stmts {
+        match stmt {
+            Stmt::Let { name, val, .. } | Stmt::Field { name, val, .. } => {
+                named.insert(name, val);
+            }
+            Stmt::Output { val, .. } => {
+                named.insert("output", val);
+            }
+            // Only a picture has a canvas to point at.
+            Stmt::Render { kind, args, .. } if kind == "image" || kind == "video" => {
+                renders.extend(args.iter().filter(|a| a.name.is_none()).map(|a| &a.val));
+            }
+            _ => {}
+        }
+    }
+    let mut reach = Reach { src, named, out: HashMap::new(), inside: Vec::new() };
+    for e in renders {
+        reach.expr(e, None);
+    }
+    reach.out
+}
+
+struct Reach<'a> {
+    src: &'a str,
+    named: HashMap<&'a str, &'a Expr>,
+    out: HashMap<usize, OnCanvas>,
+    /// Names being followed, so a work that names itself cannot loop.
+    inside: Vec<&'a str>,
+}
+
+impl<'a> Reach<'a> {
+    fn expr(&mut self, e: &'a Expr, folded: Option<&str>) {
+        match &e.kind {
+            ExprKind::Call(name, args) => {
+                if let Some(at) = range(self.src, e.span).map(|r| r.start) {
+                    let how = match folded {
+                        None => OnCanvas::Yes,
+                        Some(by) => OnCanvas::Folded(by.to_string()),
+                    };
+                    // Reached both ways: the plain way is the one to show.
+                    let entry = self.out.entry(at).or_insert_with(|| how.clone());
+                    if how == OnCanvas::Yes {
+                        *entry = OnCanvas::Yes;
+                    }
+                }
+                // The first fold met on the way down is the outermost one:
+                // what the picture does to the shape last.
+                let folded = folded.or_else(|| folds(name).then_some(name.as_str()));
+                for arg in args {
+                    self.expr(&arg.val, folded);
+                }
+            }
+            ExprKind::Var(name) => {
+                let Some(val) = self.named.get(name.as_str()).copied() else { return };
+                if self.inside.contains(&name.as_str()) {
+                    return;
+                }
+                self.inside.push(name);
+                self.expr(val, folded);
+                self.inside.pop();
+            }
+            ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
+                self.expr(a, folded);
+                self.expr(b, folded);
+            }
+            ExprKind::Neg(a) | ExprKind::Member(a, _) => self.expr(a, folded),
+            ExprKind::List(items) => items.iter().for_each(|i| self.expr(i, folded)),
+            ExprKind::Draw { dist, .. } => self.expr(dist, folded),
+            ExprKind::Choose(branches) => branches.iter().for_each(|(_, v)| self.expr(v, folded)),
+            ExprKind::Comprehension { body, loops } => {
+                self.expr(body, folded);
+                loops.iter().for_each(|(_, l)| self.expr(l, folded));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Five radii all called `outline` are told apart by their position.
@@ -333,6 +450,7 @@ impl Walk<'_> {
             line: span.line,
             at,
             call: self.call.clone(),
+            on_canvas: OnCanvas::No,
             kind,
         };
         self.out.push(knob);
@@ -658,6 +776,46 @@ mod tests {
                 assert!(!text.is_empty() && src.contains(text), "{text:?} is not in the source");
             }
         }
+    }
+
+    #[test]
+    fn a_shape_knows_whether_it_is_drawn_where_it_says() {
+        // Drawn straight: the picture shows the blob where its numbers put it.
+        let plain = "work W {\n  render image(blob(x: 0.3, y: 0.4, size: 0.2))\n}\n";
+        assert_eq!(knobs(plain)[0].on_canvas, OnCanvas::Yes);
+
+        // Through a fold: the same numbers no longer say where it lands.
+        let folded = "work W {\n  let p = blob(x: 0.3, y: 0.4)\n  output kaleidoscope(p, sides: 6)\n  render image(output)\n}\n";
+        assert_eq!(knobs(folded)[0].on_canvas, OnCanvas::Folded("kaleidoscope".into()));
+
+        // Merging, mixing and arithmetic leave a shape where it was.
+        let merged = "work W {\n  let a = blob(x: 0.3, y: 0.4)\n  let b = ripples(x: 0.6, y: 0.6) * 0.5\n  render image(merge(a, b) + glow(x: 0.2, y: 0.2))\n}\n";
+        let drawn: Vec<_> = knobs(merged).into_iter().filter(|k| k.call.is_some()).map(|k| k.on_canvas).collect();
+        assert!(drawn.iter().all(|how| *how == OnCanvas::Yes), "{drawn:?}");
+
+        // Nothing renders it: no handle to offer.
+        let unused = "work W {\n  let spare = blob(x: 0.3, y: 0.4)\n  render image(clouds(scale: 3))\n}\n";
+        let spare = knobs(unused);
+        assert_eq!(spare[0].on_canvas, OnCanvas::No);
+        assert_eq!(spare.last().unwrap().on_canvas, OnCanvas::Yes, "the clouds are drawn");
+
+        // The starter work folds its petal eight ways.
+        let rosace = knobs(ROSACE);
+        let petal = rosace.iter().find(|k| k.group == "petal").expect("the petal");
+        assert!(matches!(&petal.on_canvas, OnCanvas::Folded(by) if by == "kaleidoscope"), "{:?}", petal.on_canvas);
+
+        // A sculpture has no canvas to point at.
+        let carved = "work W {\n  render sculpture(blob(x: 0.3, y: 0.4), side: 20)\n}\n";
+        assert_eq!(knobs(carved)[0].on_canvas, OnCanvas::No);
+    }
+
+    #[test]
+    fn a_work_that_names_itself_does_not_go_round_for_ever() {
+        // `a` is used before it is given again: the later one wins, and
+        // following it must stop rather than loop.
+        let src = "work W {\n  let a = blob(x: 0.3, y: 0.4)\n  let a = merge(a, circle(x: 0.6, y: 0.6))\n  render image(a)\n}\n";
+        let knobs = knobs(src);
+        assert!(knobs.iter().any(|k| k.on_canvas == OnCanvas::Yes));
     }
 
     #[test]
