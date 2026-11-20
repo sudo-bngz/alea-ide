@@ -1,0 +1,8 @@
+/target
+/*.png
+*.wav
+*.mp4
+*.stl
+*.mid
+
+.DS_Store
