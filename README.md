@@ -6,9 +6,9 @@ and reroll the seed until one is worth keeping.
 
 ![The alea IDE showing Rosace](docs/screenshot.png)
 
-> Status: first scaffold. It shows `render image` works. Sound, MIDI, video
-> and sculpture viewports, the draws panel and drawing on the canvas are
-> planned but not there yet.
+> Status: early. It shows `render image` works. Sound, MIDI, video and
+> sculpture viewports, and drawing on the canvas, are planned but not there
+> yet.
 
 ## What it does
 
@@ -26,6 +26,45 @@ and reroll the seed until one is worth keeping.
   for, named `<work>-<seed>.png` like the command line does.
 
 The same seed draws the same edition here and with `alea work.alea --seed N`.
+
+## The controls
+
+![The controls, the list of names and the reference](docs/helpers.png)
+
+Every `choose`, every `~` and every number of the work turns up in the pane
+on the right — the draws the seed decides first, then the numbers written
+once.
+
+The code stays the truth. A control holds no value of its own: it reads one
+out of the text and writes one back, so moving a slider and typing the
+number yourself are the same edit, and the preview redraws either way.
+
+- A **number** is dragged. It keeps the shape it was written in: `80` moves
+  in whole millimetres, `0.015` in thousandths.
+- A **range** — `~between(0.5, 0.8)` — has its two ends dragged, which
+  widens or narrows what the next edition may draw.
+- A **choice** — `choose { 5 | 6 | 8 }` — has one box per option. Type in a
+  box to change that option (the work is rewritten once you leave it, never
+  mid-word), `×` takes one out, `+` adds one more.
+
+Holding a draw at one value while the rest reroll (pinning) needs the engine
+to say which value each draw got, which it does not yet.
+
+## While you write
+
+- **Names are offered as you type**: the work's own `let`s and parameters
+  first, then the primitives, functions and forms of the language, with the
+  signature and what the reference says about the selected one. `↑` `↓` to
+  choose, `Enter` or `Tab` to take it, `Esc` to dismiss, `Ctrl/Cmd+Space` to
+  ask for the list. Inside a `render`, its own options are offered
+  (`palette:` in an image, `duration:` in a sound).
+- **The reference is a key away.** `F1` opens it under the code, on the name
+  the cursor is on, and it is searchable by name or by what something does.
+  Resting the pointer on a name in the code shows the same card.
+
+The reference is alea's own `docs/reference.md`, vendored here as
+`assets/reference.md` and read at startup, so what the language documents is
+what the IDE offers. `scripts/update-reference.sh ../alea` refreshes it.
 
 ## Run
 
@@ -47,6 +86,8 @@ cargo run --release -- rosace.alea   # or a file
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl/Cmd+O` / `S` | Open / save |
 | `Ctrl/Cmd+E` | Export PNG |
+| `Ctrl/Cmd+Space` | Offer names here |
+| `F1` / `Ctrl/Cmd+K` | The reference |
 
 ## How it is built
 
@@ -56,6 +97,9 @@ cargo run --release -- rosace.alea   # or a file
   request).
 - [`qell-core`](https://github.com/sudo-bngz/qell) provides the alea syntax
   highlighting.
+- The controls read the work's own syntax tree, keeping the slice of source
+  each draw and number occupies (`src/draws.rs`), and write back into those
+  slices.
 - [egui](https://github.com/emilk/egui) draws the window (`src/app.rs`).
 
 ## Licence

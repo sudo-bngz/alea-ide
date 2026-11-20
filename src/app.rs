@@ -6,14 +6,17 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::text::{LayoutJob, TextFormat};
+use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{
-    Align, Align2, Color32, ColorImage, Context, FontId, Key, Layout, Modifiers, Rect, RichText, Sense, Stroke, TextureOptions,
-    Vec2,
+    Align, Align2, Color32, ColorImage, Context, FontId, Id, Key, Layout, Modifiers, Pos2, Rect, RichText, Sense, Stroke,
+    TextureOptions, Vec2,
 };
 
+use crate::complete::{self, Candidate};
 use crate::doc::{format_seed, parse_seed, random_seed, Doc, Tab, STARTER};
+use crate::draws::{self, Edit, Kind, Knob, Num};
 use crate::engine::{self, Engine, Job, Outcome, Preview};
+use crate::reference::{self, Entry};
 use crate::theme;
 
 /// How long the text must rest before a preview is drawn.
@@ -37,6 +40,46 @@ pub struct App {
     /// Longest side the viewport can show, in pixels (rounded up, so small
     /// resizes do not redraw).
     side: usize,
+    /// The names offered for the word being typed.
+    offer: Option<Offer>,
+    /// The option of a `choose` being typed into, kept out of the source
+    /// until it is finished: half-typed code would parse as nothing and the
+    /// controls would vanish under the hand editing them.
+    editing: Option<Editing>,
+    /// The knobs of the active document, and the version they were read from.
+    knobs: Vec<Knob>,
+    knobs_of: Option<(usize, u64)>,
+    reference: Option<Reference>,
+}
+
+/// The completion list, as it stands between two frames.
+struct Offer {
+    items: Vec<Candidate>,
+    at: usize,
+    /// The word being completed, in bytes of the document.
+    word: std::ops::Range<usize>,
+    /// Where to draw the list: under the cursor.
+    under: Pos2,
+}
+
+struct Editing {
+    knob: usize,
+    option: usize,
+    text: String,
+}
+
+/// The reference drawer: what is typed in its search box, and what is open.
+#[derive(Default)]
+struct Reference {
+    query: String,
+    shown: Option<String>,
+}
+
+enum Key2 {
+    None,
+    Move(isize),
+    Accept,
+    Close,
 }
 
 impl App {
@@ -54,6 +97,11 @@ impl App {
             exporting: false,
             notice: None,
             side: 512,
+            offer: None,
+            editing: None,
+            knobs: Vec::new(),
+            knobs_of: None,
+            reference: None,
         };
         match file {
             Some(path) => app.open(path),
@@ -252,6 +300,49 @@ impl App {
         if cmd(Key::W) {
             self.close(self.active);
         }
+        let help = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) || cmd(Key::K);
+        if help {
+            self.open_reference(ctx);
+        }
+    }
+
+    /// Opens the reference, on the name the cursor is on when it is on one.
+    fn open_reference(&mut self, ctx: &Context) {
+        if self.reference.is_some() {
+            self.reference = None;
+            return;
+        }
+        let doc = self.tabs[self.active].doc;
+        let word = cursor_of(ctx, doc)
+            .map(|index| {
+                let text = &self.docs[doc].text;
+                text[complete::word_at(text, byte_of_char(text, index))].to_string()
+            })
+            // A number under the cursor is not a name to look up.
+            .filter(|word| word.starts_with(|c: char| c.is_alphabetic() || c == '_'));
+        let shown = word.as_deref().and_then(reference::find).map(|e| e.name.clone());
+        self.reference = Some(Reference { query: shown.clone().or(word).unwrap_or_default(), shown });
+    }
+
+    /// The knobs of the work on screen, read again when its text changes.
+    fn knobs(&mut self) {
+        let doc = self.tabs[self.active].doc;
+        let want = (doc, self.docs[doc].version);
+        if self.knobs_of != Some(want) {
+            self.knobs = draws::knobs(&self.docs[doc].text);
+            self.knobs_of = Some(want);
+        }
+    }
+
+    /// Rewrites the work. Every control goes through here: the text is the
+    /// only place a value is ever kept.
+    fn rewrite(&mut self, edits: Vec<Edit>) {
+        if edits.is_empty() {
+            return;
+        }
+        let doc = &mut self.docs[self.tabs[self.active].doc];
+        draws::apply(&mut doc.text, edits);
+        doc.edited();
     }
 
     fn tab_title(&self, tab: &Tab) -> String {
@@ -442,118 +533,377 @@ impl App {
     }
 
     fn code_pane(&mut self, ctx: &Context) {
-        let tab = &self.tabs[self.active];
-        let doc = &mut self.docs[tab.doc];
+        // The list of names takes these keys before the editor sees them.
+        let mut key = Key2::None;
+        if self.offer.is_some() {
+            ctx.input_mut(|i| {
+                key = if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    Key2::Move(1)
+                } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    Key2::Move(-1)
+                } else if i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab) {
+                    Key2::Accept
+                } else if i.consume_key(Modifiers::NONE, Key::Escape) {
+                    Key2::Close
+                } else {
+                    Key2::None
+                };
+            });
+        }
+        let asked = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Space));
+        match key {
+            Key2::Move(by) => {
+                if let Some(offer) = &mut self.offer {
+                    let n = offer.items.len() as isize;
+                    offer.at = (offer.at as isize + by).rem_euclid(n.max(1)) as usize;
+                }
+            }
+            Key2::Close => self.offer = None,
+            Key2::Accept => self.accept(ctx),
+            Key2::None => {}
+        }
+
+        let doc_index = self.tabs[self.active].doc;
+        let id = Id::new(("code", doc_index));
+        let failure = self.tabs[self.active].failure.clone();
+        let (busy, elapsed) = (self.tabs[self.active].busy, self.tabs[self.active].elapsed);
         let frame = egui::Frame::new().fill(theme::PANEL);
+
         egui::SidePanel::left("code").frame(frame).default_width(470.0).width_range(280.0..=760.0).show(ctx, |ui| {
+            let mut help = false;
             header(ui, "CODE", |ui| {
-                let (text, ink) = match (&tab.failure, tab.busy, tab.elapsed) {
+                let (text, ink) = match (&failure, busy, elapsed) {
                     (Some(_), _, _) => ("error".to_string(), theme::BLUSH),
                     (None, true, _) => ("drawing…".to_string(), theme::AMBER),
                     (None, false, Some(t)) => (format!("live · {} ms", t.as_millis()), theme::MOSS),
                     _ => (String::new(), theme::MUTED),
                 };
                 ui.label(RichText::new(text).small().color(ink));
+                help = ui.add(egui::Button::new("?").small()).on_hover_text("The reference (F1)").clicked();
             });
+            if help {
+                self.open_reference(ui.ctx());
+            }
 
-            if let Some(failure) = &tab.failure {
+            if let Some(failure) = &failure {
                 let frame = egui::Frame::new().fill(Color32::from_rgb(0x2a, 0x1b, 0x16)).inner_margin(12);
                 egui::TopBottomPanel::bottom("diagnostic").frame(frame).show_inside(ui, |ui| {
-                    egui::ScrollArea::both().max_height(140.0).show(ui, |ui| {
+                    egui::ScrollArea::both().max_height(120.0).show(ui, |ui| {
                         ui.add(egui::Label::new(RichText::new(failure.text.trim_end()).monospace().color(theme::BLUSH)).extend());
                     });
                 });
             }
+            self.reference_drawer(ui);
 
-            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                let font = FontId::monospace(13.0);
-                let row = ui.fonts_mut(|f| f.row_height(&font));
-                let lines = doc.text.matches('\n').count() + 1;
-                let gutter = 46.0;
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let (numbers, _) = ui.allocate_exact_size(Vec2::new(gutter, row * lines as f32 + 24.0), Sense::hover());
-
+            let font = FontId::monospace(13.0);
+            let row = ui.fonts_mut(|f| f.row_height(&font));
+            let lines = self.docs[doc_index].text.matches('\n').count() + 1;
+            let gutter = 46.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // The line numbers stay put while the code scrolls sideways.
+                let (numbers, _) = ui.allocate_exact_size(Vec2::new(gutter, ui.available_height()), Sense::hover());
+                let area = egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                         ui.painter().layout_job(highlight(text.as_str(), &font))
                     };
-                    let out = egui::TextEdit::multiline(&mut doc.text)
+                    let out = egui::TextEdit::multiline(&mut self.docs[doc_index].text)
+                        .id(id)
                         .frame(false)
                         .desired_width(f32::INFINITY)
                         .desired_rows(lines.max(24))
-                        .margin(egui::Margin::symmetric(0, 12))
+                        .margin(egui::Margin::symmetric(8, 12))
                         .lock_focus(true)
                         .layouter(&mut layouter)
                         .show(ui);
-                    if out.response.changed() {
-                        doc.edited();
-                    }
-
-                    let top = out.galley_pos.y;
-                    let bad = tab.failure.as_ref().and_then(|f| f.line);
-                    for n in 1..=lines {
-                        let y = top + row * (n - 1) as f32;
-                        if !ui.is_rect_visible(Rect::from_min_size(egui::pos2(numbers.left(), y), Vec2::new(gutter, row))) {
-                            continue;
-                        }
-                        let wrong = bad == Some(n);
-                        if wrong {
-                            let line = Rect::from_min_size(
-                                egui::pos2(numbers.left(), y),
-                                Vec2::new(ui.clip_rect().width() + gutter, row),
-                            );
-                            ui.painter().rect_filled(line, 0, Color32::from_rgba_unmultiplied(0xf0, 0x69, 0x4c, 34));
-                            ui.painter().rect_filled(Rect::from_min_size(line.min, Vec2::new(2.0, row)), 0, theme::VERMILION);
-                        }
-                        let ink = if wrong { theme::BLUSH } else { theme::FAINT };
-                        ui.painter().text(egui::pos2(numbers.right() - 14.0, y), Align2::RIGHT_TOP, n, font.clone(), ink);
-                    }
+                    (out.response.clone(), out.galley.clone(), out.galley_pos, out.cursor_range)
                 });
+                let (response, galley, galley_pos, cursor) = area.inner;
+                if response.changed() {
+                    self.docs[doc_index].edited();
+                }
+
+                let bad = failure.as_ref().and_then(|f| f.line);
+                let ink = ui.painter().with_clip_rect(numbers.intersect(ui.clip_rect()));
+                for n in 1..=lines {
+                    let y = galley_pos.y + row * (n - 1) as f32;
+                    if y < numbers.top() - row || y > numbers.bottom() {
+                        continue;
+                    }
+                    let wrong = bad == Some(n);
+                    if wrong {
+                        let line = Rect::from_min_size(egui::pos2(numbers.left(), y), Vec2::new(ui.clip_rect().width(), row));
+                        ui.painter().rect_filled(line, 0, Color32::from_rgba_unmultiplied(0xf0, 0x69, 0x4c, 34));
+                        ui.painter().rect_filled(Rect::from_min_size(line.min, Vec2::new(2.0_f32, row)), 0, theme::VERMILION);
+                    }
+                    let colour = if wrong { theme::BLUSH } else { theme::FAINT };
+                    ink.text(egui::pos2(numbers.right() - 14.0, y), Align2::RIGHT_TOP, n, font.clone(), colour);
+                }
+
+                // What the pointer rests on, straight from the reference.
+                if let (true, Some(at)) = (response.hovered(), ui.ctx().pointer_latest_pos()) {
+                    let text = &self.docs[doc_index].text;
+                    let index = galley.cursor_from_pos(at - galley_pos).index;
+                    let word = &text[complete::word_at(text, byte_of_char(text, index))];
+                    if let Some(entry) = reference::find(word) {
+                        let anchor = egui::PopupAnchor::Pointer;
+                        egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), Id::new("word-help"), anchor)
+                            .show(|ui| entry_card(ui, entry, true));
+                    }
+                }
+
+                // What to offer for the name being typed.
+                match (response.has_focus(), cursor.map(|c| c.primary.index)) {
+                    (true, Some(index)) => {
+                        let text = &self.docs[doc_index].text;
+                        let at = byte_of_char(text, index);
+                        let word = complete::word_at(text, at);
+                        let typed = !text[word.start..at].is_empty();
+                        if typed || asked || self.offer.as_ref().is_some_and(|o| o.word.start == word.start) {
+                            let items = complete::candidates(text, at);
+                            let same = self.offer.as_ref().is_some_and(|o| o.word.start == word.start);
+                            let kept = self.offer.as_ref().map_or(0, |o| o.at);
+                            let under = galley_pos + galley.pos_from_cursor(CCursor::new(index)).left_bottom().to_vec2();
+                            self.offer = (!items.is_empty()).then(|| Offer {
+                                at: if same { kept.min(items.len() - 1) } else { 0 },
+                                items,
+                                word: word.start..at,
+                                under,
+                            });
+                        } else {
+                            self.offer = None;
+                        }
+                    }
+                    _ => self.offer = None,
+                }
             });
         });
     }
 
-    fn edition_pane(&mut self, ctx: &Context) {
-        let tab = &self.tabs[self.active];
-        let frame = egui::Frame::new().fill(theme::PANEL);
-        egui::SidePanel::right("edition").frame(frame).default_width(260.0).width_range(200.0..=420.0).show(ctx, |ui| {
-            header(ui, "THIS EDITION", |_| {});
-            egui::Frame::new().inner_margin(14).show(ui, |ui| {
-                egui::Grid::new("facts").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-                    let fact = |ui: &mut egui::Ui, name: &str, value: String, ink: Color32| {
-                        ui.label(RichText::new(name).color(theme::MUTED));
-                        ui.label(RichText::new(value).monospace().color(ink));
-                        ui.end_row();
-                    };
-                    if let Some(s) = &tab.summary {
-                        fact(ui, "work", s.name.clone(), theme::PAPER);
+    /// Puts the name the list has settled on into the work.
+    fn accept(&mut self, ctx: &Context) {
+        let Some(offer) = self.offer.take() else { return };
+        let Some(item) = offer.items.get(offer.at) else { return };
+        let doc_index = self.tabs[self.active].doc;
+        let doc = &mut self.docs[doc_index];
+        if offer.word.end > doc.text.len() {
+            return;
+        }
+        doc.text.replace_range(offer.word.clone(), &item.insert);
+        doc.edited();
+        let at = char_of_byte(&doc.text, offer.word.start + item.insert.len());
+        let id = Id::new(("code", doc_index));
+        if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+            state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(at))));
+            egui::TextEdit::store_state(ctx, id, state);
+        }
+    }
+
+    /// The list of names, under the cursor.
+    fn offer_list(&mut self, ctx: &Context) {
+        let Some(offer) = &self.offer else { return };
+        let (items, at, under) = (offer.items.clone(), offer.at, offer.under);
+        let mut chosen = None;
+        egui::Area::new(Id::new("offer")).order(egui::Order::Foreground).fixed_pos(under + Vec2::new(0.0, 4.0)).show(ctx, |ui| {
+            let frame =
+                egui::Frame::new().fill(theme::BAR).stroke(Stroke::new(1.0_f32, theme::EDGE)).corner_radius(5).inner_margin(4);
+            frame.show(ui, |ui| {
+                ui.set_max_width(460.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for (k, item) in items.iter().enumerate() {
+                    let here = k == at;
+                    let fill = if here { Color32::from_rgb(0x34, 0x32, 0x2e) } else { Color32::TRANSPARENT };
+                    let row = egui::Frame::new().fill(fill).corner_radius(3).inner_margin(egui::Margin::symmetric(6, 3));
+                    let hit = row
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(item.mark).monospace().small().color(theme::FAINT));
+                                ui.label(RichText::new(&item.name).monospace().color(if here {
+                                    theme::PAPER
+                                } else {
+                                    theme::TEXT
+                                }));
+                                ui.add(egui::Label::new(RichText::new(&item.detail).small().color(theme::MUTED)).truncate());
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if hit.clicked() {
+                        chosen = Some(k);
                     }
-                    fact(ui, "seed", format_seed(tab.seed), theme::BLUSH);
-                    if let Some(s) = &tab.summary {
-                        fact(ui, "renders", s.renders.join(", "), theme::PAPER);
-                        if tab.image.is_some() {
-                            fact(ui, "export size", format!("{} × {}", tab.full.0, tab.full.1), theme::PAPER);
-                            fact(ui, "preview", format!("{} × {}", tab.image_px.0, tab.image_px.1), theme::TEXT);
-                        }
-                        if s.attempts > 1 {
-                            fact(ui, "attempts", s.attempts.to_string(), theme::TEXT);
-                        }
-                    }
-                    fact(ui, "history", format!("{} of {}", tab.at + 1, tab.history.len()), theme::TEXT);
-                });
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("The same seed draws the same edition, here and with the command line.").color(theme::MUTED),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("alea {} --seed {}", self.docs[tab.doc].file_name(), format_seed(tab.seed)))
-                        .monospace()
-                        .color(theme::TEXT),
-                );
+                }
+                if let Some(item) = items.get(at).filter(|i| !i.summary.is_empty()) {
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.add(egui::Label::new(RichText::new(&item.summary).small().color(theme::MUTED)).wrap());
+                }
             });
+        });
+        if let Some(k) = chosen {
+            if let Some(offer) = &mut self.offer {
+                offer.at = k;
+            }
+            self.accept(ctx);
+        }
+    }
+
+    /// The reference, under the code.
+    fn reference_drawer(&mut self, ui: &mut egui::Ui) {
+        let Some(mut state) = self.reference.take() else { return };
+        let mut close = false;
+        let frame = egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(12, 8));
+        egui::TopBottomPanel::bottom("reference").frame(frame).resizable(true).default_height(280.0).show_inside(ui, |ui| {
+            // The drawer lives inside the code panel: it takes the width it
+            // is given and never asks for more.
+            ui.set_max_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(caption("REFERENCE"));
+                let field =
+                    egui::TextEdit::singleline(&mut state.query).hint_text("a name, or what it does").desired_width(170.0);
+                ui.add(field);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.button("Close").clicked();
+                });
+            });
+            ui.add_space(6.0);
+
+            let found = reference::search(&state.query);
+            let list = (ui.available_width() * 0.36).clamp(110.0, 220.0);
+            ui.horizontal_top(|ui| {
+                egui::ScrollArea::vertical().id_salt("entries").auto_shrink(false).max_width(list).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(list - 16.0);
+                        for entry in found.iter().take(400) {
+                            let here = state.shown.as_deref() == Some(entry.name.as_str());
+                            let ink = if here { theme::BLUSH } else { theme::TEXT };
+                            let mut text = LayoutJob::default();
+                            text.append(entry.family.mark(), 0.0, TextFormat::simple(FontId::monospace(11.0), theme::FAINT));
+                            text.append(&entry.name, 8.0, TextFormat::simple(FontId::monospace(13.0), ink));
+                            if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                                state.shown = Some(entry.name.clone());
+                            }
+                        }
+                        if found.is_empty() {
+                            ui.label(RichText::new("Nothing of that name.").color(theme::MUTED));
+                        }
+                    });
+                });
+                ui.separator();
+                let shown = state.shown.as_deref().and_then(reference::find).or_else(|| found.first().copied());
+                egui::ScrollArea::vertical().id_salt("detail").auto_shrink(false).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        if let Some(entry) = shown {
+                            entry_card(ui, entry, false);
+                        }
+                    });
+                });
+            });
+        });
+        self.reference = (!close).then_some(state);
+    }
+
+    fn controls_pane(&mut self, ctx: &Context) {
+        self.knobs();
+        let doc_index = self.tabs[self.active].doc;
+        let source = self.docs[doc_index].text.clone();
+        let knobs = std::mem::take(&mut self.knobs);
+        let mut editing = self.editing.take();
+        let mut edits: Vec<Edit> = Vec::new();
+        let draws = knobs.iter().filter(|k| k.is_draw()).count();
+
+        let frame = egui::Frame::new().fill(theme::PANEL);
+        egui::SidePanel::right("controls").frame(frame).default_width(330.0).width_range(250.0..=560.0).show(ctx, |ui| {
+            header(ui, "CONTROLS", |ui| {
+                let text = match knobs.len() {
+                    0 => "nothing to tune".to_string(),
+                    n => format!("{draws} draws · {} numbers", n - draws),
+                };
+                ui.label(RichText::new(text).small().color(theme::MUTED));
+            });
+            self.facts_panel(ui);
+
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ui.add_space(6.0);
+                if knobs.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(14.0);
+                        let text = "Every `choose`, `~` and number of a work that reads correctly turns up here.";
+                        ui.add(egui::Label::new(RichText::new(text).color(theme::MUTED)).wrap());
+                    });
+                }
+                for (title, want_draw) in [("DRAWS", true), ("NUMBERS IN THE CODE", false)] {
+                    let section: Vec<(usize, &Knob)> =
+                        knobs.iter().enumerate().filter(|(_, k)| k.is_draw() == want_draw).collect();
+                    if section.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(8.0);
+                    egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(14, 5)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(caption(title));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let hint = if want_draw { "the seed decides these" } else { "written once" };
+                                ui.label(RichText::new(hint).small().color(theme::FAINT));
+                            });
+                        });
+                    });
+                    let mut group = String::new();
+                    for (k, knob) in section {
+                        if group != knob.group {
+                            group = knob.group.clone();
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(caption(&knob.group.to_uppercase()));
+                            });
+                        }
+                        egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 3)).show(ui, |ui| {
+                            knob_row(ui, k, knob, &source, &mut editing, &mut edits);
+                        });
+                    }
+                }
+                ui.add_space(14.0);
+            });
+        });
+
+        self.knobs = knobs;
+        self.editing = editing;
+        self.rewrite(edits);
+    }
+
+    /// What the edition is, under the controls.
+    fn facts_panel(&mut self, ui: &mut egui::Ui) {
+        let tab = &self.tabs[self.active];
+        let (seed, summary, full, at, history) = (tab.seed, tab.summary.clone(), tab.full, tab.at, tab.history.len());
+        let file = self.docs[tab.doc].file_name();
+        let frame = egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(14, 10));
+        egui::TopBottomPanel::bottom("facts").frame(frame).show_inside(ui, |ui| {
+            egui::Grid::new("facts").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+                let fact = |ui: &mut egui::Ui, name: &str, value: String, ink: Color32| {
+                    ui.label(RichText::new(name).small().color(theme::MUTED));
+                    ui.label(RichText::new(value).monospace().small().color(ink));
+                    ui.end_row();
+                };
+                if let Some(s) = &summary {
+                    fact(ui, "work", s.name.clone(), theme::PAPER);
+                    fact(ui, "renders", s.renders.join(", "), theme::PAPER);
+                    if s.attempts > 1 {
+                        fact(ui, "attempts", s.attempts.to_string(), theme::TEXT);
+                    }
+                }
+                fact(ui, "seed", format_seed(seed), theme::BLUSH);
+                if full.0 > 0 {
+                    fact(ui, "exports", format!("{} × {}", full.0, full.1), theme::TEXT);
+                }
+                let _ = (at, history);
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("alea {file} --seed {}", format_seed(seed))).monospace().small().color(theme::MUTED),
+                )
+                .truncate(),
+            );
         });
     }
 
@@ -620,8 +970,9 @@ impl eframe::App for App {
         self.top_bar(ctx);
         self.seed_strip(ctx);
         self.code_pane(ctx);
-        self.edition_pane(ctx);
+        self.controls_pane(ctx);
         self.viewport(ctx);
+        self.offer_list(ctx);
         self.request(ctx);
 
         let tab = &self.tabs[self.active];
@@ -687,6 +1038,123 @@ fn thumbnail(p: &Preview) -> ColorImage {
         }
     }
     ColorImage::from_rgb([w, h], &rgb)
+}
+
+/// Where the cursor is in the code of `doc`, counted in characters.
+fn cursor_of(ctx: &Context, doc: usize) -> Option<usize> {
+    egui::TextEdit::load_state(ctx, Id::new(("code", doc)))?.cursor.char_range().map(|r| r.primary.index)
+}
+
+/// egui counts characters; the source is indexed in bytes.
+fn byte_of_char(text: &str, index: usize) -> usize {
+    text.char_indices().nth(index).map_or(text.len(), |(i, _)| i)
+}
+
+fn char_of_byte(text: &str, at: usize) -> usize {
+    text[..at.min(text.len())].chars().count()
+}
+
+/// What the reference says about one name.
+fn entry_card(ui: &mut egui::Ui, entry: &Entry, compact: bool) {
+    let width = if compact { 420.0 } else { ui.available_width() };
+    ui.set_max_width(width.max(160.0));
+    ui.vertical(|ui| {
+        ui.add(egui::Label::new(RichText::new(&entry.signature).monospace().color(theme::PAPER)).wrap());
+        ui.label(RichText::new(&entry.section).small().color(theme::FAINT));
+        if !entry.summary.is_empty() {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(&entry.summary).color(theme::TEXT)).wrap());
+        }
+        if !compact && !entry.params().is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("parameters: {}", entry.params().join(", "))).small().color(theme::MUTED));
+        }
+    });
+}
+
+/// One number, dragged. The value it shows is read out of the code every
+/// frame, and dragging writes a new one back in the same shape.
+fn drag(ui: &mut egui::Ui, id: (usize, usize), num: &Num) -> Option<Edit> {
+    let mut value = num.value;
+    let widget = egui::DragValue::new(&mut value).speed(num.speed()).fixed_decimals(num.decimals);
+    let shown = ui.push_id(id, |ui| ui.add(widget)).inner;
+    (shown.changed() && value != num.value).then(|| Edit { at: num.at.clone(), text: num.text(value) })
+}
+
+/// One row of the controls: a choice, a range, or a number.
+fn knob_row(ui: &mut egui::Ui, index: usize, knob: &Knob, source: &str, editing: &mut Option<Editing>, edits: &mut Vec<Edit>) {
+    match &knob.kind {
+        Kind::Number(num) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::TEXT)).truncate());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(edit) = drag(ui, (index, 0), num) {
+                        edits.push(edit);
+                    }
+                });
+            });
+        }
+        Kind::Spread { dist, per_point, names, from, to } => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::PAPER)).truncate());
+                let draw = format!("{}{dist}", if *per_point { "~~" } else { "~" });
+                ui.label(RichText::new(draw).monospace().small().color(theme::VERMILION));
+            });
+            ui.horizontal(|ui| {
+                for (slot, (name, num)) in [(names[0], from), (names[1], to)].into_iter().enumerate() {
+                    ui.label(RichText::new(name).small().color(theme::MUTED));
+                    if let Some(edit) = drag(ui, (index, slot + 1), num) {
+                        edits.push(edit);
+                    }
+                }
+            });
+        }
+        Kind::Choose { options, body } => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(&knob.label).color(theme::PAPER)).truncate());
+                ui.label(RichText::new("choose").monospace().small().color(theme::VERMILION));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                for (k, option) in options.iter().enumerate() {
+                    let mine = editing.as_ref().is_some_and(|e| e.knob == knob.at && e.option == k);
+                    let mut text = match &editing {
+                        Some(e) if mine => e.text.clone(),
+                        _ => option.text.clone(),
+                    };
+                    let width = (text.chars().count() as f32 * 7.6 + 14.0).clamp(34.0, 180.0);
+                    let field = egui::TextEdit::singleline(&mut text)
+                        .font(FontId::monospace(12.0))
+                        .text_color(theme::AMBER)
+                        .desired_width(width)
+                        .margin(egui::Margin::symmetric(6, 3));
+                    let shown = ui.push_id((knob.at, k), |ui| ui.add(field)).inner;
+                    if shown.changed() {
+                        *editing = Some(Editing { knob: knob.at, option: k, text: text.clone() });
+                    }
+                    // The work is rewritten once the option is finished, so
+                    // that half-typed code never reaches it.
+                    if mine && shown.lost_focus() {
+                        if let Some(Editing { text, .. }) = editing.take() {
+                            if text != option.text && !text.trim().is_empty() {
+                                edits.push(Edit { at: option.at.clone(), text });
+                            }
+                        }
+                    }
+                    let can_remove = body.is_some() && options.len() > 1;
+                    let cross = egui::Button::new(RichText::new("×").small().color(theme::FAINT)).frame(false);
+                    if ui.add_enabled(can_remove, cross).on_hover_text("Take this one out").clicked() {
+                        edits.extend(draws::remove_option(source, options, k));
+                    }
+                }
+                if let Some(body) = body {
+                    if ui.button(RichText::new("+").small()).on_hover_text("One more, copied from the last").clicked() {
+                        edits.extend(draws::add_option(source, options, body));
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
